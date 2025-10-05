@@ -15,6 +15,7 @@ from huggingface_hub import InferenceClient
 import json
 import os
 import time
+from fastapi.middleware.cors import CORSMiddleware
 
 ############################################################
 # Model / client setup
@@ -26,7 +27,13 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else InferenceClient()
 
 app = FastAPI(title="HF Chat Tutor Bot", version="0.2.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or restrict to your LAN IP
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ############################################################
 # In-memory store (replace with Redis/Postgres in production)
 ############################################################
