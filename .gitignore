@@ -1,0 +1,47 @@
+# Ignore operating system files
+.DS_Store
+Thumbs.db
+
+# Ignore node_modules folder
+node_modules/
+
+# Ignore log files
+*.log
+
+# Ignore environment variable files
+.env
+.env.local
+.env.*.local
+
+# Ignore build output
+dist/
+build/
+
+# Ignore dependency directories
+vendor/
+target/
+
+# Ignore IDE/editor specific files
+.idea/
+.vscode/
+*.sublime-workspace
+
+# Ignore temporary files
+*.tmp
+*.swp
+*.bak
+*.old
+
+# Ignore coverage reports
+coverage/
+
+# Ignore compiled files
+*.out
+*.class
+*.pyc
+*.o
+*.obj
+
+# Ignore package-lock and yarn.lock if not needed
+package-lock.json
+yarn.lock
