@@ -67,7 +67,8 @@ class TutorState:
     # (already present) retrieval
     chunks: List[str] = field(default_factory=list)
     index: Dict[str, Any] = field(default_factory=dict)
-
+    scene: str = "opening"        # simple state machine: opening -> probe -> objection -> resolution -> wrap
+    scene_step: int = 0
 # crude in-memory map; replace with a persistent store
 SESSION: Dict[str, TutorState] = {}
 
@@ -311,6 +312,66 @@ def _hf_chat(messages: List[Dict[str, str]], temperature: float = 0.3, max_token
         content = ""
     return str(content)
 
+SCENE_GRAPH = {
+    "opening": {"probe_deeper": "probe"},
+    "probe": {"escalate_objection": "objection", "switch_perspective": "probe", "probe_deeper": "probe"},
+    "objection": {"de_escalate": "resolution", "probe_deeper": "objection"},
+    "resolution": {"probe_deeper": "resolution", "close_out": "wrap"},
+    "wrap": {}
+}
+
+def apply_branch_and_adapt(state: TutorState, data: Dict[str, Any]) -> None:
+    scen = state.scenario or {}
+    branch = (data.get("new_exercise") or {}).get("branch")
+    cur = state.scene
+
+    # scene transitions
+    nxt = SCENE_GRAPH.get(cur, {}).get(branch)
+    if nxt:
+        state.scene = nxt
+        state.scene_step = 0
+    else:
+        state.scene_step += 1
+
+    # adaptive difficulty (target ~70% success)
+    a = data.get("assessment") or {}
+    correct = a.get("correct", None)
+    cur_diff = int(scen.get("difficulty", 1))
+    if correct is True and state.progress.correct_in_a_row >= 2 and cur_diff < 5:
+        scen["difficulty"] = cur_diff + 1
+    elif correct is False and state.progress.correct_in_a_row == 0 and cur_diff > 1:
+        scen["difficulty"] = cur_diff - 1
+
+    # branch-driven pressure/tone/perspective
+    if branch == "raise_time_pressure":
+        scen["time_pressure"] = True
+    elif branch == "de_escalate":
+        scen["time_pressure"] = False
+    elif branch == "switch_perspective":
+        # swap between Mentor and Client for demo variety
+        cur_role = scen.get("bot_role", "Mentor")
+        scen["bot_role"] = "Client" if cur_role == "Mentor" else "Mentor"
+
+    state.scenario = scen
+
+
+def _ensure_assessment_present(data: Dict[str, Any], sys_msg: str, user_msg: str) -> Dict[str, Any]:
+    if isinstance(data.get("assessment"), dict):
+        return data
+    repair_user = (
+        user_msg +
+        "\n\nAdd an 'assessment' object explaining briefly why the user's last step is right/wrong and one next micro-nudge."
+        " Output JSON only with {\"assessment\":{...}}."
+    )
+    raw2 = _hf_chat(
+        [{"role":"system","content": sys_msg}, {"role":"user","content": repair_user}],
+        temperature=0.1, max_tokens=250
+    )
+    data2 = _safe_json_loads(raw2)
+    if isinstance(data2.get("assessment"), dict):
+        data["assessment"] = data2["assessment"]
+    return data
+
 
 def _safe_json_loads(s: str) -> Dict[str, Any]:
     """Parse model output into JSON.
@@ -428,7 +489,8 @@ def ingest(req: IngestRequest):
     Return only the lesson JSON.
     """.strip()
 
-    SYSTEM_TUTOR_SCOPED ="""
+
+    SYSTEM_ROLEPLAY_SCOPED = """
     You are "Roleplay Partner", a chapter-scoped simulation coach.
 
     Scope rules (hard):
@@ -438,10 +500,9 @@ def ingest(req: IngestRequest):
 
     Role-play contract:
     - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
-    - Your "reply" MUST be fully in-character dialogue or action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
-    - Ask exactly ONE realistic question or take ONE action per turn. Keep it concise and natural.
-    - Coaching/teaching goes ONLY in "assessment.explanation" (this is out-of-character). Keep it brief (1–3 sentences) and grounded in the chapter with citations when needed.
-    - If time pressure is implied by the scenario/exercise, reflect it in the in-character reply (e.g., urgency) but keep coaching OOC.
+    - Your "reply" MUST be fully in-character dialogue/action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
+    - Ask exactly ONE realistic question or take ONE action per turn.
+    - Coaching/teaching goes ONLY in "assessment.explanation" (out-of-character), 1–3 sentences, grounded in the chapter with citations when needed.
 
     Output JSON ONLY (no code fences):
     {{
@@ -450,19 +511,21 @@ def ingest(req: IngestRequest):
     "new_exercise": {{
         "type": "roleplay",
         "instructions": "<what the learner is trying to do in-scene>",
-        "prompt": "<the scene setup or next move>",
-        "choices": None,
-        "answer": "<concise rubric/criteria to judge learner responses (OOC)>",
+        "prompt": "<scene setup or next move>",
+        "choices": null,
+        "answer": "<concise rubric/criteria (OOC)>",
         "skills": ["concept1","concept2"],
-        "deadline_sec": 60 | None,
-        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective>|null"
+        "deadline_sec": 60 | null,
+        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
     }} | null,
-    "assessment": {{"correct": True|False|None, "explanation": "OOC coach hint/why", "delta_mastery": 0}} | null,
-    "progress_update":{{"mastery": 0, "correct_in_a_row": 0}} | null
+    "assessment": {{"correct": true|false|null, "explanation": "OOC coach hint/why", "delta_mastery": 0,
+                    "per_skill": [{{"skill":"probing","score":0..3}},{{"skill":"listening","score":0..3}}] }} | null,
+    "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
     }}
     """.strip()
 
-    sys_msg = SYSTEM_TUTOR_SCOPED.format(
+
+    sys_msg = SYSTEM_ROLEPLAY_SCOPED.format(
         user_role=scenario.get("user_role","Learner"),
         bot_role=scenario.get("bot_role","Mentor"),
         emotion=scenario.get("emotion","supportive"),
@@ -537,6 +600,16 @@ def chat(req: ChatRequest):
 
     # 1) Retrieve top-k chapter snippets for this turn
     top = retrieve(req.message, state.chunks, state.index, k=3)
+    if not top:
+        if state.chunks:
+            top = [(f"C{i+1}", c) for i, c in enumerate(state.chunks[:3])]
+        else:
+            return ChatResponse(
+                user_id=req.user_id,
+                reply="I don’t have any snippets from this chapter yet. Please re-ingest the chapter.",
+                state=_state_public_view(state),
+            )
+
     sources_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
 
     user_msg = CHAT_USER_SCOPED.format(
@@ -557,7 +630,7 @@ def chat(req: ChatRequest):
     difficulty = int(scenario.get("difficulty", 1))
     
 
-    SYSTEM_TUTOR_SCOPED ="""
+    SYSTEM_ROLEPLAY_SCOPED = """
     You are "Roleplay Partner", a chapter-scoped simulation coach.
 
     Scope rules (hard):
@@ -567,10 +640,9 @@ def chat(req: ChatRequest):
 
     Role-play contract:
     - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
-    - Your "reply" MUST be fully in-character dialogue or action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
-    - Ask exactly ONE realistic question or take ONE action per turn. Keep it concise and natural.
-    - Coaching/teaching goes ONLY in "assessment.explanation" (this is out-of-character). Keep it brief (1–3 sentences) and grounded in the chapter with citations when needed.
-    - If time pressure is implied by the scenario/exercise, reflect it in the in-character reply (e.g., urgency) but keep coaching OOC.
+    - Your "reply" MUST be fully in-character dialogue/action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
+    - Ask exactly ONE realistic question or take ONE action per turn.
+    - Coaching/teaching goes ONLY in "assessment.explanation" (out-of-character), 1–3 sentences, grounded in the chapter with citations when needed.
 
     Output JSON ONLY (no code fences):
     {{
@@ -579,19 +651,21 @@ def chat(req: ChatRequest):
     "new_exercise": {{
         "type": "roleplay",
         "instructions": "<what the learner is trying to do in-scene>",
-        "prompt": "<the scene setup or next move>",
-        "choices": None,
-        "answer": "<concise rubric/criteria to judge learner responses (OOC)>",
+        "prompt": "<scene setup or next move>",
+        "choices": null,
+        "answer": "<concise rubric/criteria (OOC)>",
         "skills": ["concept1","concept2"],
-        "deadline_sec": 60 | None,
-        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective>|null"
+        "deadline_sec": 60 | null,
+        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
     }} | null,
-    "assessment": {{"correct": True|False|None, "explanation": "OOC coach hint/why", "delta_mastery": 0}} | null,
-    "progress_update":{{"mastery": 0, "correct_in_a_row": 0}} | null
+    "assessment": {{"correct": true|false|null, "explanation": "OOC coach hint/why", "delta_mastery": 0,
+                    "per_skill": [{{"skill":"probing","score":0..3}},{{"skill":"listening","score":0..3}}] }} | null,
+    "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
     }}
     """.strip()
 
-    sys_msg = SYSTEM_TUTOR_SCOPED.format(
+
+    sys_msg = SYSTEM_ROLEPLAY_SCOPED.format(
         user_role=scenario.get("user_role", "Learner"),
         bot_role=scenario.get("bot_role", "Mentor"),
         emotion=scenario.get("emotion", "supportive"),
@@ -637,6 +711,10 @@ def chat(req: ChatRequest):
                 data["assessment"]["delta_mastery"] = -1
 
     # 4) Update progress if assessment present
+    # Always ensure we coach OOC
+    data = _ensure_assessment_present(data, sys_msg=sys_msg, user_msg=user_msg)
+
+    # Progress update (you already have this)
     assessment = data.get("assessment") or {}
     if assessment and isinstance(assessment, dict):
         state.progress.attempts += 1
@@ -647,9 +725,17 @@ def chat(req: ChatRequest):
             state.progress.correct_in_a_row = 0
             state.progress.mastery = max(0, min(100, state.progress.mastery - 1))
 
-    # 5) Queue new exercise if provided
+    # Scene + adaptation controller
+    apply_branch_and_adapt(state, data)
+
+    # Force roleplay type for exercises
+    # Force roleplay type for exercises
     new_ex = data.get("new_exercise")
-    if new_ex:
+    if isinstance(new_ex, dict) and new_ex.get("type") != "roleplay":
+        new_ex["type"] = "roleplay"
+
+    # ✅ Persist so deadlines and scene progress work next turn
+    if isinstance(new_ex, dict):
         state.exercise_queue.append(new_ex)
         state.last_prompt_at = time.time()
 
@@ -660,9 +746,9 @@ def chat(req: ChatRequest):
 
     # 7) Return
   # Coerce exercise type to roleplay if present
-    new_ex = data.get("new_exercise")
-    if isinstance(new_ex, dict) and new_ex.get("type") != "roleplay":
-        new_ex["type"] = "roleplay"
+    # new_ex = data.get("new_exercise")
+    # if isinstance(new_ex, dict) and new_ex.get("type") != "roleplay":
+    #     new_ex["type"] = "roleplay"
 
     payload = {
         "user_id": req.user_id,
