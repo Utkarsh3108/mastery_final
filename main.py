@@ -98,6 +98,7 @@ class ScenarioConfig(BaseModel):
     learning_style: str | None = None  # e.g., "practice-first", "examples", "Socratic"
     time_pressure: bool = False
     emotion: str = "supportive"  # "supportive" | "neutral" | "challenging"
+    roleplay_only: bool = True 
 
 class ScenarioSetResponse(BaseModel):
     ok: bool
@@ -117,7 +118,8 @@ class ChatResponse(BaseModel):
     reply: str
     state:Dict[str, Any] 
     new_exercise: Optional[Dict[str, Any]] = None # redacted/sanitized subset of TutorState for UI
-
+    assessment: Optional[Dict[str, Any]] = None
+    citations: Optional[List[str]] = None
 ############################################################
 # Prompting templates
 ############################################################
@@ -190,37 +192,8 @@ def _valid_citations(cites: Any, allowed_ids: list[str]) -> bool:
 REFUSAL_PREFIX = "I’m limited to the provided chapter"
 
 
-SYSTEM_TUTOR_SCOPED = """
-You are "Socratic Coach", a chapter-scoped tutor.
 
-Scope rules (hard):
-- Use ONLY the CHAPTER SNIPPETS provided.
-- If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
-- Never invent facts. Every factual statement must map to a snippet; include citations like [C1], [C2].
 
-Pedagogy & scenario:
-- Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style preference: {learning_style}.
-- Ask ONE focused question at a time. Prefer hints before answers.
-- For feedback on answers: explain WHY it’s right/wrong, citing snippets.
-
-Output JSON ONLY (no code fences):
-{{
-  "reply": "<tutor speaks in-role & tone>",
-  "citations": ["C1","C2"] | [],
-  "new_exercise": {{
-      "type": "mcq|short_answer|coding|roleplay|reflection",
-      "instructions": "...",
-      "prompt": "...",
-      "choices": ["A","B","C","D"] | null,
-      "answer": "<expected answer or rubric>" | null,
-      "skills": ["concept1","concept2"],
-      "deadline_sec": 60 | null,
-      "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective>|null"
-  }} | null,
-  "assessment": {{"correct": true|false|null, "explanation": "why (with citations)", "delta_mastery": 0}} | null,
-  "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
-}}
-""".strip()
 
 # SYSTEM_TUTOR = (
 #     """
@@ -427,6 +400,10 @@ def ingest(req: IngestRequest):
     scenario = getattr(sess, "scenario", {}) if sess else {}
     time_pressure = bool(scenario.get("time_pressure", False))
     difficulty = int(scenario.get("difficulty", 1))
+    user_role=scenario.get("user_role","Learner")
+    bot_role = scenario.get("bot_role","Mentor")
+    emotion =scenario.get("emotion","supportive")
+    learning_style = scenario.get("learning_style","")
 
     ingest_user = f"""
     User profile:
@@ -444,11 +421,45 @@ def ingest(req: IngestRequest):
     CHAPTER SNIPPETS:
     {sources_block}
 
-    Task: Build a lesson plan and the first in-scope exercise STRICTLY from the snippets.
-    - Prefer a roleplay-style exercise if appropriate.
-    - Include a small 'deadline_sec' (e.g., 45–90s) if time pressure is True.
-    - Always attach a concise rubric in 'answer' so we can grade.
+    Task: Build a lesson plan and the first in-scope ROLE-PLAY exercise STRICTLY from the snippets.
+    - The first 'reply' must be an in-character opening line from {scenario.get("bot_role","the mentor")} that sets the scene and asks ONE question.
+    - The returned 'exercise' MUST set "type": "roleplay" with an OOC 'answer' rubric to judge the learner's next turn.
+    - If time_pressure is True, include a reasonable 'deadline_sec' (45–90s).
     Return only the lesson JSON.
+    """.strip()
+
+    SYSTEM_TUTOR_SCOPED ="""
+    You are "Roleplay Partner", a chapter-scoped simulation coach.
+
+    Scope rules (hard):
+    - Use ONLY the CHAPTER SNIPPETS provided.
+    - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
+    - Never invent facts. Any statement that relies on the chapter must be supportable by the snippets; include citations like [C1], [C2].
+
+    Role-play contract:
+    - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
+    - Your "reply" MUST be fully in-character dialogue or action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
+    - Ask exactly ONE realistic question or take ONE action per turn. Keep it concise and natural.
+    - Coaching/teaching goes ONLY in "assessment.explanation" (this is out-of-character). Keep it brief (1–3 sentences) and grounded in the chapter with citations when needed.
+    - If time pressure is implied by the scenario/exercise, reflect it in the in-character reply (e.g., urgency) but keep coaching OOC.
+
+    Output JSON ONLY (no code fences):
+    {{
+    "reply": "<in-character utterance only>",
+    "citations": ["C1","C2"] | [],
+    "new_exercise": {{
+        "type": "roleplay",
+        "instructions": "<what the learner is trying to do in-scene>",
+        "prompt": "<the scene setup or next move>",
+        "choices": None,
+        "answer": "<concise rubric/criteria to judge learner responses (OOC)>",
+        "skills": ["concept1","concept2"],
+        "deadline_sec": 60 | None,
+        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective>|null"
+    }} | null,
+    "assessment": {{"correct": True|False|None, "explanation": "OOC coach hint/why", "delta_mastery": 0}} | null,
+    "progress_update":{{"mastery": 0, "correct_in_a_row": 0}} | null
+    }}
     """.strip()
 
     sys_msg = SYSTEM_TUTOR_SCOPED.format(
@@ -537,8 +548,49 @@ def chat(req: ChatRequest):
         sources_block=sources_block,
         user_message=req.message,
     )
-
     scenario = state.scenario or {}
+
+    user_role=scenario.get("user_role","Learner")
+    bot_role = scenario.get("bot_role","Mentor")
+    emotion =scenario.get("emotion","supportive")
+    learning_style = scenario.get("learning_style","")
+    difficulty = int(scenario.get("difficulty", 1))
+    
+
+    SYSTEM_TUTOR_SCOPED ="""
+    You are "Roleplay Partner", a chapter-scoped simulation coach.
+
+    Scope rules (hard):
+    - Use ONLY the CHAPTER SNIPPETS provided.
+    - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
+    - Never invent facts. Any statement that relies on the chapter must be supportable by the snippets; include citations like [C1], [C2].
+
+    Role-play contract:
+    - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
+    - Your "reply" MUST be fully in-character dialogue or action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
+    - Ask exactly ONE realistic question or take ONE action per turn. Keep it concise and natural.
+    - Coaching/teaching goes ONLY in "assessment.explanation" (this is out-of-character). Keep it brief (1–3 sentences) and grounded in the chapter with citations when needed.
+    - If time pressure is implied by the scenario/exercise, reflect it in the in-character reply (e.g., urgency) but keep coaching OOC.
+
+    Output JSON ONLY (no code fences):
+    {{
+    "reply": "<in-character utterance only>",
+    "citations": ["C1","C2"] | [],
+    "new_exercise": {{
+        "type": "roleplay",
+        "instructions": "<what the learner is trying to do in-scene>",
+        "prompt": "<the scene setup or next move>",
+        "choices": None,
+        "answer": "<concise rubric/criteria to judge learner responses (OOC)>",
+        "skills": ["concept1","concept2"],
+        "deadline_sec": 60 | None,
+        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective>|null"
+    }} | null,
+    "assessment": {{"correct": True|False|None, "explanation": "OOC coach hint/why", "delta_mastery": 0}} | null,
+    "progress_update":{{"mastery": 0, "correct_in_a_row": 0}} | null
+    }}
+    """.strip()
+
     sys_msg = SYSTEM_TUTOR_SCOPED.format(
         user_role=scenario.get("user_role", "Learner"),
         bot_role=scenario.get("bot_role", "Mentor"),
@@ -607,14 +659,27 @@ def chat(req: ChatRequest):
     state.updated_at = time.time()
 
     # 7) Return
+  # Coerce exercise type to roleplay if present
+    new_ex = data.get("new_exercise")
+    if isinstance(new_ex, dict) and new_ex.get("type") != "roleplay":
+        new_ex["type"] = "roleplay"
+
     payload = {
         "user_id": req.user_id,
         "reply": data.get("reply", "(No reply)"),
         "state": _state_public_view(state),
+        "assessment": data.get("assessment"),   # OOC coaching/explanation
+        "citations": data.get("citations"),     # chapter-source proof
     }
     if new_ex:
         payload["new_exercise"] = new_ex
-    return payload  # FastAPI will coerce to ChatResponse
+
+    return payload
+
+
+    # if new_ex:
+    #     payload["new_exercise"] = new_ex
+    # return payload  # FastAPI will coerce to ChatResponse
 
 @app.get("/state/{user_id}")
 def get_state(user_id: str) -> Dict[str, Any]:
