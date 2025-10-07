@@ -1,11 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   SafeAreaView, View, Text, TextInput, TouchableOpacity, ScrollView,
   KeyboardAvoidingView, Platform, ActivityIndicator, Alert
 } from "react-native";
 
 import * as DocumentPicker from "expo-document-picker";
-
 
 // IMPORTANT: Point this to your FastAPI server.
 // iOS Simulator: http://localhost:8000
@@ -14,20 +13,18 @@ import * as DocumentPicker from "expo-document-picker";
 const BASE_URL = "http://127.0.0.1:8000";
 
 /** -------------------------
- * Types (align with backend)
+ * Types (align with new backend)
  * ------------------------*/
 
-type ExerciseType = "mcq" | "short_answer" | "coding" | "roleplay" | "reflection";
-
 interface Exercise {
-  type: ExerciseType;
+  type: "roleplay";
   instructions?: string | null;
   prompt?: string | null;
-  choices?: string[] | null;
-  answer?: string | null; // rubric (OOC)
+  choices?: string[] | null; // backend always null, kept for safety
+  answer?: string | null;    // rubric (OOC), shown as hints when combining
   skills?: string[];
   deadline_sec?: number | null;
-  branch?: "probe_deeper" | "raise_time_pressure" | "de_escalate" | "switch_perspective" | null;
+  branch?: "probe_deeper" | "raise_time_pressure" | "de_escalate" | "switch_perspective" | "escalate_objection" | "close_out" | null;
 }
 
 interface LessonPlan {
@@ -45,20 +42,27 @@ interface IngestResponse {
 
 interface ChatResponse {
   user_id: string;
-  reply: string;
+  reply: string; // may sometimes contain JSON as string; we sanitize
   state: {
     chapter_title: string;
     chapter_source?: string | null;
     chapter_summary: string;
     learning_objectives: string[];
     roleplay_persona: string;
-    progress: { mastery: number; correct_in_a_row: number; attempts: number };
+    signals_preview: { empathy: number; text_evidence: number; bias_check: number; curiosity: number };
     exercise_queue_len: number;
   };
   new_exercise?: Exercise | null;
-  assessment?: { correct: boolean | null; explanation?: string; delta_mastery?: number } | null;
   citations?: string[] | null;
 }
+
+interface EndResponse { user_id: string; final_feedback: {
+  summary: string;
+  strengths?: string[];
+  growth?: string[];
+  chapter_evidence?: { quote_or_paraphrase: string; why_it_matters: string; citations?: string[] }[];
+  metrics?: { empathy: number; text_evidence: number; bias_check: number; curiosity: number };
+}; }
 
 /** -------------------------
  * Small UI atoms
@@ -116,102 +120,78 @@ const Badge: React.FC<{ label: string }> = ({ label }) => (
 const Bubble: React.FC<{ role: "user" | "assistant"; text: string }> = ({ role, text }) => (
   <View style={{
     alignSelf: role === "user" ? "flex-end" : "flex-start",
-    backgroundColor: role === "user" ? "#2563EB" : "#F3F4F6",
+    backgroundColor: role === "user" ? "#111827" : "#F3F4F6",
     padding: 10, marginVertical: 6, borderRadius: 14, maxWidth: "85%",
   }}>
     <Text style={{ color: role === "user" ? "#fff" : "#111827" }}>{text}</Text>
   </View>
 );
 
-const CoachNote: React.FC<{ text?: string }> = ({ text }) =>
-  !text ? null : (
-    <View style={{ backgroundColor: "#FFFBEB", borderColor: "#F59E0B", borderWidth: 1, padding: 8, borderRadius: 10, marginTop: 6 }}>
-      <Text style={{ color: "#92400E" }}>Coach: {text}</Text>
-    </View>
-  );
-
 const CitationsRow: React.FC<{ cites?: string[] | null }> = ({ cites }) =>
   !cites || cites.length === 0 ? null : (
-    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
       {cites.map((c, i) => <Badge key={i} label={c} />)}
     </View>
   );
 
-const ExerciseCard: React.FC<{
-  ex: Exercise;
-  onAnswer?: (text: string) => void;
-  onCountdownDone?: () => void;
-}> = ({ ex, onAnswer, onCountdownDone }) => {
-  const [val, setVal] = useState("");
-  const [remaining, setRemaining] = useState<number | null>(
-    typeof ex.deadline_sec === "number" ? ex.deadline_sec : null
-  );
+/** -------------------------
+ * Sanitizers & Composers
+ * ------------------------*/
+function stripFences(t: string): string {
+  if (!t) return t;
+  const s = t.trim();
+  if (s.startsWith("```")) {
+    return s.split("\n").filter((ln) => !ln.trim().startsWith("```")) .join("\n").trim();
+  }
+  return s;
+}
 
-  useEffect(() => {
-    if (remaining === null) return;
-    if (remaining <= 0) {
-      onCountdownDone?.();
-      return;
+function safeReply(raw: any): string {
+  if (raw == null) return "";
+  if (typeof raw === "string") {
+    const s = stripFences(raw);
+    if (s.startsWith("{") && s.endsWith("}")) {
+      try {
+        const obj = JSON.parse(s);
+        if (obj && typeof obj.reply === "string") return obj.reply;
+      } catch {}
     }
-    const t = setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
-    return () => clearTimeout(t);
-  }, [remaining, onCountdownDone]);
+    const m = s.match(/"reply"\s*:\s*"([\s\S]*?)"\s*(,|\})/);
+    if (m) {
+      try { return JSON.parse(`"${m[1]}"`); } catch { return m[1]; }
+    }
+    return s;
+  }
+  if (typeof raw === "object" && typeof raw.reply === "string") return raw.reply;
+  return String(raw);
+}
 
-  return (
-    <View style={{ borderWidth: 1, borderColor: "#D1D5DB", borderRadius: 12, padding: 12, marginVertical: 8 }}>
-      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-        <Text style={{ fontWeight: "700" }}>{ex.instructions || "Exercise"}</Text>
-        {remaining !== null && remaining >= 0 ? (
-          <Badge label={`⏳ ${remaining}s`} />
-        ) : null}
-      </View>
-      {ex.prompt ? <Text style={{ marginTop: 6, marginBottom: 10 }}>{ex.prompt}</Text> : null}
+function combineFirstBotBubble(lp: LessonPlan, firstPrompt: string): string {
+  const persona = lp.roleplay_persona ? `🎭 ${lp.roleplay_persona}` : "";
+  const ex = (lp.first_exercise || {}) as Exercise;
+  const instr = ex.instructions ? `\n\n📝 Task: ${ex.instructions}` : "";
+  const prompt = firstPrompt || ex.prompt || "";
+  const clock = typeof ex.deadline_sec === "number" ? `  ⏳${ex.deadline_sec}s` : "";
+  const hint = ex.answer ? `\n\n💡 Hints: ${ex.answer}` : "";
+  const skills = ex.skills && ex.skills.length ? `\n\n🎯 Skills: ${ex.skills.join(", ")}` : "";
+  const body = prompt ? `\n\n${prompt}${clock}` : "";
+  return [persona, instr, body, hint, skills].filter(Boolean).join("");
+}
 
-      {ex.choices && Array.isArray(ex.choices) && ex.choices.length > 0 ? (
-        <View style={{ gap: 8 }}>
-          {ex.choices.map((c, idx) => (
-            <Button key={idx} title={c} onPress={() => onAnswer?.(c)} />
-          ))}
-        </View>
-      ) : (
-        <View>
-          <TextInput
-            value={val}
-            onChangeText={setVal}
-            placeholder="Type your answer..."
-            placeholderTextColor="#999"
-            multiline
-            style={{ borderWidth: 1, borderColor: "#E5E7EB", borderRadius: 8, padding: 8, minHeight: 60, marginBottom: 8 }}
-          />
-          <Button title="Submit" onPress={() => onAnswer?.(val)} />
-        </View>
-      )}
-
-      {ex.skills && ex.skills.length > 0 ? (
-        <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 10 }}>
-          {ex.skills.map((s, i) => <Badge key={i} label={s} />)}
-        </View>
-      ) : null}
-    </View>
-  );
-};
+function combineChatAssistantBubble(reply: string, ex?: Exercise | null): string {
+  const r = safeReply(reply);
+  if (!ex) return r;
+  const instr = ex.instructions ? `\n\n📝 Next: ${ex.instructions}` : "";
+  const p = ex.prompt ? `\n${ex.prompt}` : "";
+  const clock = typeof ex.deadline_sec === "number" ? `  ⏳${ex.deadline_sec}s` : "";
+  const hint = ex.answer ? `\n\n💡 Hints: ${ex.answer}` : "";
+  const skills = ex.skills && ex.skills.length ? `\n\n🎯 Skills: ${ex.skills.join(", ")}` : "";
+  return [r, instr, p + clock, hint, skills].filter(Boolean).join("");
+}
 
 /** -------------------------
  * API helpers
  * ------------------------*/
-// async function apiIngestFile(fd: FormData): Promise<IngestResponse> {
-//   const res = await fetch(`${BASE_URL}/ingest_file`, {
-//     method: "POST",
-//     body: fd, // fetch sets multipart boundaries automatically
-//   });
-//   if (!res.ok) {
-//     const t = await res.text();
-//     throw new Error(`Ingest (file) failed: ${res.status} ${t}`);
-//   }
-//   return res.json();
-// }
-
-// put near your API helpers
 async function toFormDataFile(
   picked: { uri: string; name?: string; mime?: string }
 ): Promise<any /* RN file or Web File */> {
@@ -219,52 +199,17 @@ async function toFormDataFile(
   const mime = picked.mime || "text/plain";
 
   if (Platform.OS === "web") {
-    // Browser needs a Blob/File
     const blob = await fetch(picked.uri).then(r => r.blob());
     return new File([blob], filename, { type: mime });
   }
-  // Native (iOS/Android) needs { uri, name, type }
   return { uri: picked.uri, name: filename, type: mime } as any;
 }
 
 async function apiIngestFile(fd: FormData): Promise<IngestResponse> {
   const res = await fetch(`${BASE_URL}/ingest_file`, { method: "POST", body: fd });
-  const body = await res.text(); // read once
-  if (!res.ok) {
-    // show server 422 body in the UI logs
-    try {
-      const json = JSON.parse(body);
-      console.log("IngestFile error JSON:", json);
-    } catch {
-      console.log("IngestFile error text:", body);
-    }
-    throw new Error(`Ingest (file) failed: ${res.status} ${body}`);
-  }
+  const body = await res.text();
+  if (!res.ok) throw new Error(`Ingest (file) failed: ${res.status} ${body}`);
   return JSON.parse(body);
-}
-
-
-async function apiScenario(payload: {
-  user_id: string;
-  book: string;
-  user_role: string;
-  bot_role: string;
-  difficulty: number;
-  learning_style?: string | null;
-  time_pressure?: boolean;
-  emotion?: "supportive" | "neutral" | "challenging";
-  roleplay_only?: boolean;
-}): Promise<{ ok: boolean }> {
-  const res = await fetch(`${BASE_URL}/scenario`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Scenario failed: ${res.status} ${t}`);
-  }
-  return res.json();
 }
 
 async function apiIngest(payload: {
@@ -299,113 +244,106 @@ async function apiChat(payload: { user_id: string; message: string }): Promise<C
   return res.json();
 }
 
+async function apiEnd(payload: { user_id: string }): Promise<EndResponse> {
+  const res = await fetch(`${BASE_URL}/end`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`End failed: ${res.status} ${t}`);
+  }
+  return res.json();
+}
+
 /** -------------------------
  * Screen Component
  * ------------------------*/
 
-type Msg =
-  | { kind: "bubble"; role: "user" | "assistant"; text: string; citations?: string[] | null; coach?: string | null }
-  | { kind: "exercise"; ex: Exercise };
+type Msg = { kind: "bubble"; role: "user" | "assistant"; text: string; citations?: string[] | null };
 
 export default function TutorScreen() {
   const [screen, setScreen] = useState<"setup" | "chat">("setup");
   const [pickedFile, setPickedFile] = useState<{ uri: string; name: string; mime: string } | null>(null);
 
-
-  // Setup form
+  // Setup form — ONLY what's required by backend
   const [userId, setUserId] = useState("demo-user");
-  const [chapterTitle, setChapterTitle] = useState("Recursion Basics");
-  const [chapterText, setChapterText] = useState("Paste your chapter text here…");
-  const [chapterSource, setChapterSource] = useState("");
-
-  // Profile
-  const [background, setBackground] = useState("Finance professional dabbling in Python");
-  const [goals, setGoals] = useState("Crack recursion and write clean functions");
+  const [chapterTitle, setChapterTitle] = useState("");
+  const [chapterText, setChapterText] = useState("");
+  const [background, setBackground] = useState("");
+  const [goals, setGoals] = useState("");
   const [level, setLevel] = useState("beginner");
-
-  // Scenario (NEW)
-  const [book, setBook] = useState("Sample Book");
-  const [userRole, setUserRole] = useState("Learner");
-  const [botRole, setBotRole] = useState("Mentor");
-  const [difficulty, setDifficulty] = useState("2");
-  const [learningStyle, setLearningStyle] = useState("Socratic");
-  const [timePressure, setTimePressure] = useState(false);
-  const [emotion, setEmotion] = useState<"supportive" | "neutral" | "challenging">("supportive");
 
   // Lesson + Chat state
   const [lesson, setLesson] = useState<LessonPlan | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [finalFeedback, setFinalFeedback] = useState<EndResponse["final_feedback"] | null>(null);
   const scrollRef = useRef<ScrollView>(null);
-  const progress = useRef({ mastery: 0, streak: 0, attempts: 0 });
 
   const header = useMemo(() => {
     if (!lesson) return null;
     return (
       <View style={{ borderBottomWidth: 1, borderColor: "#E5E7EB", paddingBottom: 8, marginBottom: 8 }}>
-        <Text style={{ fontWeight: "800", fontSize: 18, marginBottom: 6 }}>{chapterTitle}</Text>
+        <Text style={{ fontWeight: "800", fontSize: 18, marginBottom: 6 }}>{chapterTitle || "Chapter"}</Text>
         <Text style={{ color: "#374151", marginBottom: 6 }}>{lesson.chapter_summary}</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 4 }}>
           {lesson.learning_objectives.map((o, i) => (<Badge key={i} label={o} />))}
         </ScrollView>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
           <Badge label={`Persona: ${lesson.roleplay_persona.slice(0, 40)}${lesson.roleplay_persona.length > 40 ? "…" : ""}`} />
-          <Badge label={`Mastery: ${progress.current.mastery}%`} />
-          <Badge label={`Streak: ${progress.current.streak}`} />
         </View>
       </View>
     );
   }, [lesson, chapterTitle]);
 
- const startLesson = async () => {
-  try {
-    setLoading(true);
-    let res: IngestResponse;
+  const startLesson = async () => {
+    try {
+      if (!userId || !(pickedFile || chapterText) || !background || !goals) {
+        Alert.alert("Missing info", "Please provide User ID, chapter (file or text), background, and goals.");
+        return;
+      }
+      setLoading(true);
+      let res: IngestResponse;
 
-    if (pickedFile) {
-      const fd = new FormData();
-      fd.append("user_id", userId);
-      // Backend will auto-title if this is empty, so safe either way:
-      fd.append("chapter_title", chapterTitle || "");
-      fd.append("profile_background", background);
-      fd.append("profile_goals", goals);
-      fd.append("profile_level", level || "");
-      if (chapterSource) fd.append("chapter_source", chapterSource);
+      if (pickedFile) {
+        const fd = new FormData();
+        fd.append("user_id", userId);
+        fd.append("chapter_title", chapterTitle || ""); // backend will auto-title if empty
+        fd.append("profile_background", background);
+        fd.append("profile_goals", goals);
+        fd.append("profile_level", level || "");
+        const filePart = await toFormDataFile(pickedFile);
+        fd.append("chapter_file", filePart);
+        res = await apiIngestFile(fd);
+      } else {
+        res = await apiIngest({
+          user_id: userId,
+          chapter_title: chapterTitle || "",
+          chapter_text: chapterText,
+          profile: { background, goals, level },
+        });
+      }
 
-      const filePart = await toFormDataFile(pickedFile);
-      fd.append("chapter_file", filePart); // <- name matches backend
+      const lp: LessonPlan = res.lesson_plan;
+      setLesson(lp);
 
-      res = await apiIngestFile(fd);
-    } else {
-      // JSON fallback for quick testing without a file
-      res = await apiIngest({
-        user_id: userId,
-        chapter_title: chapterTitle,
-        chapter_text: chapterText,
-        chapter_source: chapterSource || undefined,
-        profile: { background, goals, level },
-      });
+      const combined = combineFirstBotBubble(lp, res.first_prompt);
+      const initMsgs: Msg[] = [{ kind: "bubble", role: "assistant", text: combined }];
+      setMessages(initMsgs);
+      setScreen("chat");
+    } catch (e: any) {
+      Alert.alert("Error", e?.message || String(e));
+    } finally {
+      setLoading(false);
     }
-
-    const lp: LessonPlan = res.lesson_plan;
-    setLesson(lp);
-
-    const initMsgs: Msg[] = [];
-    if (res.first_prompt) initMsgs.push({ kind: "bubble", role: "assistant", text: res.first_prompt });
-    if (lp.first_exercise) initMsgs.push({ kind: "exercise", ex: lp.first_exercise });
-    setMessages(initMsgs);
-    setScreen("chat");
-  } catch (e: any) {
-    Alert.alert("Error", e?.message || String(e));
-  } finally {
-    setLoading(false);
-  }
-};
-
-
+  };
 
   const sendMessage = async (text: string) => {
+    if (ended) return; // lock after debrief
     if (!text.trim()) return;
     const userBubble: Msg = { kind: "bubble", role: "user", text };
     setMessages((m) => [...m, userBubble]);
@@ -413,59 +351,44 @@ export default function TutorScreen() {
 
     try {
       const res = await apiChat({ user_id: userId, message: text });
-
-      // Update progress
-      progress.current = {
-        mastery: res.state.progress.mastery,
-        streak: res.state.progress.correct_in_a_row,
-        attempts: res.state.progress.attempts,
-      };
-
-      // Assistant bubble (with optional coaching + citations)
-      setMessages((m) => [
-        ...m,
-        {
-          kind: "bubble",
-          role: "assistant",
-          text: res.reply || "(No reply)",
-          citations: res.citations || null,
-          coach: res.assessment?.explanation || null,
-        },
-      ]);
-
-      // Next exercise if any
-      if (res.new_exercise) {
-        setMessages((m) => [...m, { kind: "exercise", ex: res.new_exercise as Exercise }]);
-      }
+      const combined = combineChatAssistantBubble(res.reply, res.new_exercise || undefined);
+      const next: Msg[] = [
+        { kind: "bubble", role: "assistant", text: combined, citations: res.citations || null },
+      ];
+      setMessages((m) => [...m, ...next]);
     } catch (e: any) {
       Alert.alert("Error", e?.message || String(e));
     }
   };
 
-  const onAnswerExercise = (answerText: string) => {
-    sendMessage(answerText);
+  const callEnd = async () => {
+    if (ended) return;
+    try {
+      setLoading(true);
+      const res = await apiEnd({ user_id: userId });
+      setFinalFeedback(res.final_feedback);
+      setEnded(true);
+    } catch (e: any) {
+      Alert.alert("Error", e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
   };
 
-  // If an exercise times out client-side, gently nudge user to send any message to continue.
-  const onExerciseTimeout = () => {
-    setMessages((m) => [
-      ...m,
-      { kind: "bubble", role: "assistant", text: "⏰ Time’s up for that turn—reply with your next move and we’ll review briefly.", citations: null, coach: null },
-    ]);
-  };
-
+  // ---------------
+  // Render
+  // ---------------
   if (screen === "setup") {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
           <ScrollView contentContainerStyle={{ padding: 16 }}>
-            <Text style={{ fontSize: 22, fontWeight: "800", marginBottom: 12 }}>Tutor Setup</Text>
+            <Text style={{ fontSize: 22, fontWeight: "800", marginBottom: 12 }}>Start a Scene Reenactment</Text>
 
-            <Section title="User & Chapter">
+            <Section title="User & Chapter (Required)">
               <Input label="User ID" value={userId} onChangeText={setUserId} />
-              <Input label="Chapter Title" value={chapterTitle} onChangeText={setChapterTitle} />
-              <Input label="Chapter Source (optional)" value={chapterSource} onChangeText={setChapterSource} />
-              <Input label="Chapter Text" value={chapterText} onChangeText={setChapterText} multiline placeholder="Paste the chapter/material here" />
+              <Input label="Chapter Title (optional)" value={chapterTitle} onChangeText={setChapterTitle} />
+
               <TouchableOpacity
                 onPress={async () => {
                   const res = await DocumentPicker.getDocumentAsync({
@@ -475,46 +398,23 @@ export default function TutorScreen() {
                   });
                   if (res.canceled) return;
                   const file = res.assets[0];
-                  setPickedFile({
-                    uri: file.uri,
-                    name: file.name ?? "chapter.txt",
-                    mime: file.mimeType ?? "text/plain",
-                  });
+                  setPickedFile({ uri: file.uri, name: file.name ?? "chapter.txt", mime: file.mimeType ?? "text/plain" });
                 }}
                 style={{ paddingVertical: 10, paddingHorizontal: 12, borderWidth: 1, borderColor: "#D1D5DB", borderRadius: 8 }}
               >
-                <Text>{pickedFile ? `📄 ${pickedFile.name}` : "Choose .txt file"}</Text>
+                <Text>{pickedFile ? `📄 ${pickedFile.name}` : "Choose .txt file (or paste text below)"}</Text>
               </TouchableOpacity>
+
+              <Input label="OR Paste Chapter Text" value={chapterText} onChangeText={setChapterText} multiline placeholder="Paste the chapter/material here" />
             </Section>
 
-            <Section title="Profile for Personalization">
+            <Section title="Learner Profile (Required)">
               <Input label="Background" value={background} onChangeText={setBackground} />
-              <Input label="Goals" value={goals} onChangeText={setGoals} />
-              <Input label="Level" value={level} onChangeText={setLevel} placeholder="beginner / intermediate / advanced" />
+              <Input label="Goal" value={goals} onChangeText={setGoals} />
+              <Input label="Level (optional)" value={level} onChangeText={setLevel} placeholder="beginner / intermediate / advanced" />
             </Section>
 
-            <Section title="Scenario (Role-play)">
-              <Input label="Book" value={book} onChangeText={setBook} />
-              <Input label="Your Role (Learner)" value={userRole} onChangeText={setUserRole} />
-              <Input label="Bot Role (Mentor/CFO/etc.)" value={botRole} onChangeText={setBotRole} />
-              <Input label="Difficulty (1–5)" value={difficulty} onChangeText={setDifficulty} />
-              <Input label="Learning Style" value={learningStyle} onChangeText={setLearningStyle} placeholder="Socratic / examples / practice-first" />
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                <TouchableOpacity onPress={() => setTimePressure((s) => !s)} style={{ paddingVertical: 8, paddingHorizontal: 12, borderWidth: 1, borderColor: "#D1D5DB", borderRadius: 8 }}>
-                  <Text>{timePressure ? "✅ Time Pressure: ON" : "⏱️ Time Pressure: OFF"}</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() =>
-                    setEmotion((e) => (e === "supportive" ? "neutral" : e === "neutral" ? "challenging" : "supportive"))
-                  }
-                  style={{ paddingVertical: 8, paddingHorizontal: 12, borderWidth: 1, borderColor: "#D1D5DB", borderRadius: 8 }}
-                >
-                  <Text>Emotion: {emotion}</Text>
-                </TouchableOpacity>
-              </View>
-            </Section>
-
-            <Button title={loading ? "Starting…" : "Start Lesson"} onPress={startLesson} disabled={loading} />
+            <Button title={loading ? "Starting…" : "Start"} onPress={startLesson} disabled={loading} />
             {loading ? <View style={{ marginTop: 12 }}><ActivityIndicator /></View> : null}
             <View style={{ height: 30 }} />
           </ScrollView>
@@ -523,51 +423,79 @@ export default function TutorScreen() {
     );
   }
 
+  // Chat screen — minimal: summary header + debrief (optional) + chat list + composer
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
         <View style={{ flex: 1, paddingHorizontal: 12, paddingTop: 8 }}>
-          {header}
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+            <View style={{ flex: 1 }}>{header}</View>
+            {!ended ? (
+              <TouchableOpacity onPress={callEnd} style={{ paddingVertical: 8, paddingHorizontal: 12, borderWidth: 1, borderColor: '#D1D5DB', borderRadius: 8 }}>
+                <Text>End & Debrief</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+
+          {/* Debrief card */}
+          {finalFeedback ? (
+            <View style={{ borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 12, padding: 12, marginBottom: 8, backgroundColor: '#F9FAFB' }}>
+              <Text style={{ fontWeight: '800', marginBottom: 6 }}>Session Debrief</Text>
+              <Text style={{ marginBottom: 8 }}>{finalFeedback.summary}</Text>
+              {finalFeedback.strengths && finalFeedback.strengths.length ? (
+                <View style={{ marginBottom: 8 }}>
+                  <Text style={{ fontWeight: '700', marginBottom: 4 }}>Strengths</Text>
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+                    {finalFeedback.strengths.map((s, i) => <Badge key={i} label={s} />)}
+                  </View>
+                </View>
+              ) : null}
+              {finalFeedback.growth && finalFeedback.growth.length ? (
+                <View style={{ marginBottom: 8 }}>
+                  <Text style={{ fontWeight: '700', marginBottom: 4 }}>Next steps</Text>
+                  {finalFeedback.growth.map((g, i) => <Text key={i}>• {g}</Text>)}
+                </View>
+              ) : null}
+              {finalFeedback.chapter_evidence && finalFeedback.chapter_evidence.length ? (
+                <View>
+                  <Text style={{ fontWeight: '700', marginBottom: 4 }}>Evidence</Text>
+                  {finalFeedback.chapter_evidence.map((e, i) => (
+                    <View key={i} style={{ marginBottom: 6 }}>
+                      <Text style={{ fontStyle: 'italic' }}>
+                        “{e.quote_or_paraphrase}”
+                      </Text>
+                      <Text>{e.why_it_matters}</Text>
+                      {e.citations && e.citations.length ? <CitationsRow cites={e.citations} /> : null}
+                    </View>
+                  ))}
+                </View>
+              ) : null}
+            </View>
+          ) : null}
+
           <ScrollView
             ref={scrollRef}
             onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
+            contentContainerStyle={{ paddingBottom: 8 }}
           >
-            {messages.map((m, idx) => {
-              if (m.kind === "bubble") {
-                return (
-                  <View key={idx} style={{ marginBottom: 2 }}>
-                    <Bubble role={m.role} text={m.text} />
-                    {m.role === "assistant" ? (
-                      <>
-                        <CoachNote text={m.coach || undefined} />
-                        <CitationsRow cites={m.citations} />
-                      </>
-                    ) : null}
-                  </View>
-                );
-              }
-              // exercise
-              return (
-                <ExerciseCard
-                  key={idx}
-                  ex={m.ex}
-                  onAnswer={onAnswerExercise}
-                  onCountdownDone={onExerciseTimeout}
-                />
-              );
-            })}
-            <View style={{ height: 8 }} />
+            {messages.map((m, idx) => (
+              <View key={idx} style={{ marginBottom: 2 }}>
+                <Bubble role={m.role} text={m.text} />
+                {m.role === "assistant" ? <CitationsRow cites={m.citations} /> : null}
+              </View>
+            ))}
           </ScrollView>
 
           <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 8 }}>
             <TextInput
               value={input}
               onChangeText={setInput}
-              placeholder="Type your message…"
+              editable={!ended}
+              placeholder={ended ? "Session ended — view debrief above" : "Type your line in the scene…"}
               placeholderTextColor="#999"
-              style={{ flex: 1, borderWidth: 1, borderColor: "#D1D5DB", borderRadius: 9999, paddingHorizontal: 14, paddingVertical: 10 }}
+              style={{ flex: 1, borderWidth: 1, borderColor: "#E5E7EB", borderRadius: 9999, paddingHorizontal: 14, paddingVertical: 10 }}
             />
-            <TouchableOpacity onPress={() => sendMessage(input)} style={{ backgroundColor: "#111827", paddingVertical: 12, paddingHorizontal: 16, borderRadius: 9999 }}>
+            <TouchableOpacity disabled={ended} onPress={() => sendMessage(input)} style={{ backgroundColor: ended ? "#9CA3AF" : "#111827", paddingVertical: 12, paddingHorizontal: 16, borderRadius: 9999 }}>
               <Text style={{ color: "#fff", fontWeight: "700" }}>Send</Text>
             </TouchableOpacity>
           </View>

@@ -1,50 +1,67 @@
 from __future__ import annotations
 
-# HF Tutor Bot — single-file FastAPI app that:
-# 1) Ingests a chapter + user profile
-# 2) Builds a customized lesson plan
-# 3) Runs interactive tutoring with role‑play + exercises
-# 4) Tracks simple progress in-memory (swap with Redis/DB for prod)
+"""
+Scene Reenactment Bot — FastAPI (single file)
+
+What it does
+------------
+- Ingest a chapter text + learner profile/goal
+- Builds a chapter-scoped, character-led scene plan (no tutor voice)
+- Runs interactive, in-character role-play that reenacts scenes (not Q&A)
+- Tracks soft signals silently (empathy, text evidence, bias check, curiosity)
+- Provides a single end-of-session feedback summary upon /end
+
+Keep-alives
+-----------
+- Uses Hugging Face InferenceClient exactly (no change to how HF is called)
+- Stays strictly within chapter via snippet retrieval + forced citations [C#]
+
+Run
+---
+$ export HF_MODEL=deepseek-ai/DeepSeek-V3-0324  # or your model
+$ export HF_TOKEN=...  # if needed
+$ uvicorn app:app --reload --port 8000
+
+Dependencies
+------------
+fastapi, pydantic, huggingface_hub, scikit-learn (optional), uvicorn
+"""
 
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field, asdict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from huggingface_hub import InferenceClient
-import json
-import os
-import time
-import re
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import UploadFile, File, Form
+from huggingface_hub import InferenceClient
 
-############################################################
+import os, re, time, json
+
+# =====================
 # Model / client setup
-############################################################
+# =====================
 HF_MODEL = os.getenv("HF_MODEL", "deepseek-ai/DeepSeek-V3-0324")
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-# If your HF endpoint requires a token, set HF_TOKEN in env
 client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else InferenceClient()
 
-app = FastAPI(title="HF Chat Tutor Bot", version="0.2.0")
+app = FastAPI(title="Scene Reenactment Bot", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or restrict to your LAN IP
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-############################################################
-# In-memory store (replace with Redis/Postgres in production)
-############################################################
+
+# =====================
+# State & storage
+# =====================
 @dataclass
-class Progress:
-    # naive progress model: 0-100 mastery, plus streaks
-    mastery: int = 0
-    correct_in_a_row: int = 0
-    attempts: int = 0
+class Signals:
+    empathy: float = 0.0
+    text_evidence: float = 0.0
+    bias_check: float = 0.0
+    curiosity: float = 0.0
 
 @dataclass
 class TutorState:
@@ -55,33 +72,29 @@ class TutorState:
     chapter_summary: str
     learning_objectives: List[str]
     roleplay_persona: str
-    exercise_queue: List[Dict[str, Any]] = field(default_factory=list)
-    history: List[Dict[str, str]] = field(default_factory=list)  # minimal transcript
-    progress: Progress = field(default_factory=Progress)
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    # NEW: scenario & runtime
-    scenario: Dict[str, Any] = field(default_factory=dict)
-    last_prompt_at: float = field(default_factory=time.time)
-    achievements: List[str] = field(default_factory=list)
-
-    # (already present) retrieval
     chunks: List[str] = field(default_factory=list)
     index: Dict[str, Any] = field(default_factory=dict)
-    scene: str = "opening"        # simple state machine: opening -> probe -> objection -> resolution -> wrap
+    history: List[Dict[str, str]] = field(default_factory=list)
+    exercise_queue: List[Dict[str, Any]] = field(default_factory=list)
+    signals: Signals = field(default_factory=Signals)
+    signal_log: List[Dict[str, float]] = field(default_factory=list)
+    scene: str = "opening"
     scene_step: int = 0
-# crude in-memory map; replace with a persistent store
+    scenario: Dict[str, Any] = field(default_factory=dict)
+    last_prompt_at: float = field(default_factory=time.time)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    ended: bool = False
+
 SESSION: Dict[str, TutorState] = {}
 
-############################################################
-# Pydantic request/response models
-############################################################
+# =====================
+# Pydantic I/O models
+# =====================
 class Profile(BaseModel):
     background: str = Field(..., description="User background/context")
-    goals: str = Field(..., description="Learning goals in user's words")
-    level: Optional[str] = Field(
-        None, description="Self-assessed level (e.g., beginner/intermediate/advanced)"
-    )
+    goals: str = Field(..., description="Learning goal in user's words")
+    level: Optional[str] = Field(None, description="Self-assessed level")
 
 class IngestRequest(BaseModel):
     user_id: str
@@ -89,22 +102,6 @@ class IngestRequest(BaseModel):
     chapter_text: str
     chapter_source: Optional[str] = None
     profile: Profile
-
-# --- NEW: scenario config sent from UI ---
-class ScenarioConfig(BaseModel):
-    user_id: str
-    book: str
-    user_role: str           # e.g., "Audit Associate"
-    bot_role: str            # e.g., "Client CFO"
-    difficulty: int = 1      # 1..5
-    learning_style: str | None = None  # e.g., "practice-first", "examples", "Socratic"
-    time_pressure: bool = False
-    emotion: str = "supportive"  # "supportive" | "neutral" | "challenging"
-    roleplay_only: bool = True 
-
-class ScenarioSetResponse(BaseModel):
-    ok: bool
-
 
 class IngestResponse(BaseModel):
     user_id: str
@@ -118,37 +115,37 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     user_id: str
     reply: str
-    state:Dict[str, Any] 
-    new_exercise: Optional[Dict[str, Any]] = None # redacted/sanitized subset of TutorState for UI
-    assessment: Optional[Dict[str, Any]] = None
+    state: Dict[str, Any]
+    new_exercise: Optional[Dict[str, Any]] = None
     citations: Optional[List[str]] = None
-############################################################
-# Prompting templates
-############################################################
 
-# ==========================
-# Chapter-scoped user template + retrieval
-# ==========================
-CHAT_USER_SCOPED = """
-Learner:
-- Background: {background}
-- Goals: {goals}
-- Level: {level}
+class EndRequest(BaseModel):
+    user_id: str
 
-Chapter: {chapter_title}
-Learning objectives: {learning_objectives}
+class EndResponse(BaseModel):
+    user_id: str
+    final_feedback: Dict[str, Any]
 
-CHAPTER SNIPPETS (the ONLY allowed knowledge):
-{sources_block}
+# =====================
+# Utilities — chunking, retrieval, HF call, parsing
+# =====================
 
-User says: "{user_message}"
+def _denest_if_needed(data: Dict[str, Any]) -> Dict[str, Any]:
+    """If the model double-serialized the full object into data['reply'], unwrap it."""
+    try:
+        r = data.get("reply")
+        if isinstance(r, str):
+            s = r.strip()
+            if (s.startswith("{") and s.endswith("}")) or (s.startswith("```") and s.endswith("```")):
+                inner = _safe_json_loads(s)  # your existing tolerant parser
+                # If the inner looks like the real payload, use it
+                if isinstance(inner, dict) and ("reply" in inner or "new_exercise" in inner or "citations" in inner):
+                    return inner
+    except Exception:
+        pass
+    return data
 
-Follow SYSTEM rules. Output JSON only using the schema. If out-of-scope → use the refusal template.
-""".strip()
-
-
-
-def chunk_text(text: str, max_chars: int = 900, overlap: int = 120) -> list[str]:
+def chunk_text(text: str, max_chars: int = 900, overlap: int = 120) -> List[str]:
     text = re.sub(r"\s+", " ", text or "").strip()
     if not text:
         return []
@@ -162,17 +159,18 @@ def chunk_text(text: str, max_chars: int = 900, overlap: int = 120) -> list[str]
         i = max(punct - overlap, i + 1)
     return [c for c in chunks if c]
 
-def build_index(chunks: list[str]) -> dict:
+
+def build_index(chunks: List[str]) -> Dict[str, Any]:
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
-        from sklearn.metrics.pairwise import cosine_similarity  # noqa: F401
         vec = TfidfVectorizer(min_df=1, ngram_range=(1, 2))
         X = vec.fit_transform(chunks)
         return {"type": "tfidf", "vec": vec, "X": X}
     except Exception:
         return {"type": "fallback"}
 
-def retrieve(question: str, chunks: list[str], index: dict, k: int = 3) -> list[tuple[str, str]]:
+
+def retrieve(question: str, chunks: List[str], index: Dict[str, Any], k: int = 3) -> List[tuple[str, str]]:
     if not chunks:
         return []
     if index.get("type") == "tfidf":
@@ -186,250 +184,141 @@ def retrieve(question: str, chunks: list[str], index: dict, k: int = 3) -> list[
         order = [i for i, _ in sorted(scores, key=lambda t: t[1], reverse=True)[:k]]
     return [(f"C{idx+1}", chunks[idx]) for idx in order]
 
-def _valid_citations(cites: Any, allowed_ids: list[str]) -> bool:
-    if not isinstance(cites, list): return False
-    if not cites: return False
-    return all(c in allowed_ids for c in cites)
 
-REFUSAL_PREFIX = "I’m limited to the provided chapter"
-
-
-
-
-
-# SYSTEM_TUTOR = (
-#     """
-# You are "Socratic Coach", a warm, rigorous AI tutor. You adapt teaching to the
-# user's profile and goals, keep explanations concise, and prefer questions over monologues.
-
-# Rules:
-# - Always use plain language first; add technical depth only as needed.
-# - Teach via: micro-explanations → targeted questions → feedback → next action.
-# - Incorporate role-play when useful (e.g., interviewer/candidate, teacher/student, clinician/patient).
-# - When asking a question, ask ONE focused question at a time.
-# - If the user seems stuck, offer a small hint rather than the full answer.
-# - Keep turns short and interactive.
-
-# Output format:
-# Respond as a JSON object ONLY (no markdown fences), with keys:
-# {
-#   "reply": "<what the tutor says to the learner>",
-#   "new_exercise": {
-#       "type": "mcq|short_answer|coding|roleplay|reflection",
-#       "instructions": "...",
-#       "prompt": "...",
-#       "choices": ["A","B","C","D"],
-#       "answer": "<expected answer or rubric>",
-#       "skills": ["concept1", "concept2"]
-#   } | null,
-#   "assessment": {
-#       "correct": true|false|null,
-#       "explanation": "why",
-#       "delta_mastery": 0
-#   } | null,
-#   "progress_update": {"mastery": 0, "correct_in_a_row": 0} | null
-# }
-# If something doesn't apply, set it to null.
-#     """
-# ).strip()
-
-# INGEST_USER_MSG = (
-#     """
-# Build a customized lesson plan from this chapter for the specific learner.
-
-# User profile:
-# - Background: {background}
-# - Goals: {goals}
-# - Level: {level}
-
-# Scenario:
-# - Learner role: {{scenario.get("user_role","Learner")}}
-# - Your role: {scenario.get("bot_role","Mentor")}
-# - Difficulty: {difficulty}/5
-# - Learning style: {scenario.get("learning_style","")}
-# - Time pressure: {time_pressure}
-
-# Chapter title: {chapter_title}
-# Chapter text:
-# {chapter_text}
-
-# Return JSON ONLY with keys:
-# {{
-#   "chapter_summary": "3-5 sentence summary",
-#   "learning_objectives": ["objective 1", "objective 2", "objective 3"],
-#   "roleplay_persona": "who the tutor pretends to be and why",
-#   "exercise": {{
-#       "type": "mcq|short_answer|coding|roleplay|reflection",
-#       "instructions": "...",
-#       "prompt": "...",
-#       "choices": ["A","B","C","D"],
-#       "answer": "<expected answer or rubric>",
-#       "skills": ["concept1", "concept2"]
-#   }}
-# }}
-#     """
-# ).strip()
-
-CHAT_USER_MSG = (
-    """
-Context for this session (summarized):
-- Learner background: {background}
-- Goals: {goals}
-- Level: {level}
-- Chapter title: {chapter_title}
-- Chapter summary: {chapter_summary}
-- Learning objectives: {learning_objectives}
-- Your role-play persona: {roleplay_persona}
-- Current mastery: {mastery}/100; streak: {streak}
-
-The learner says: "{user_message}"
-
-Follow SYSTEM_TUTOR rules and output JSON ONLY using the specified schema.
-    """
-).strip()
-
-############################################################
-# Utility: model call + robust JSON parsing
-############################################################
-
-# --- shared ingest core ---
-def _ingest_core(user_id: str, chapter_title: str, chapter_text: str,
-                 chapter_source: str | None, profile: dict[str, Any]) -> IngestResponse:
-    # 1) Build retrieval artifacts
-    chunks = chunk_text(chapter_text)
-    index = build_index(chunks)
-
-    # 2) Use retrieval to plan (overview)
-    overview_q = f"Provide a short summary and learning objectives for: {chapter_title}"
-    top = retrieve(overview_q, chunks, index, k=3)
-
-    # sources_block = "\n".join([f"[{{cid}}] {{txt}}" for cid, txt in top])
-    sources_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
-    # 3) Scenario parameters (if set via /scenario)
-    sess = SESSION.get(user_id)
-    scenario = getattr(sess, "scenario", {}) if sess else {}
-    time_pressure = bool(scenario.get("time_pressure", False))
-    difficulty = int(scenario.get("difficulty", 1))
-
-    ingest_user = f"""
-    User profile:
-    - Background: {profile.get("background")}
-    - Goals: {profile.get("goals")}
-    - Level: {profile.get("level") or "unspecified"}
-
-    Scenario:
-    - Learner role: {scenario.get("user_role","Learner")}
-    - Your role: {scenario.get("bot_role","Mentor")}
-    - Difficulty: {difficulty}/5
-    - Learning style: {scenario.get("learning_style","")}
-    - Time pressure: {time_pressure}
-
-    CHAPTER SNIPPETS:
-    {sources_block}
-
-    Task: Build a lesson plan and the first in-scope ROLE-PLAY exercise STRICTLY from the snippets.
-    - The first 'reply' must be an in-character opening line from {scenario.get("bot_role","the mentor")} that sets the scene and asks ONE question.
-    - The returned 'exercise' MUST set "type": "roleplay" with an OOC 'answer' rubric to judge the learner's next turn.
-    - If time_pressure is True, include a reasonable 'deadline_sec' (45–90s).
-    Return only the lesson JSON.
-    """.strip()
-
-    SYSTEM_ROLEPLAY_SCOPED = """
-    You are "Roleplay Partner", a chapter-scoped simulation coach.
-
-    Scope rules (hard):
-    - Use ONLY the CHAPTER SNIPPETS provided.
-    - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
-    - Never invent facts. Any statement that relies on the chapter must be supportable by the snippets; include citations like [C1], [C2].
-
-    Role-play contract:
-    - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
-    - Your "reply" MUST be fully in-character dialogue/action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
-    - Ask exactly ONE realistic question or take ONE action per turn.
-    - Coaching/teaching goes ONLY in "assessment.explanation" (out-of-character), 1–3 sentences, grounded in the chapter with citations when needed.
-
-    Output JSON ONLY (no code fences):
-    {{
-    "reply": "<in-character utterance only>",
-    "citations": ["C1","C2"] | [],
-    "new_exercise": {{
-        "type": "roleplay",
-        "instructions": "<what the learner is trying to do in-scene>",
-        "prompt": "<scene setup or next move>",
-        "choices": null,
-        "answer": "<concise rubric/criteria (OOC)>",
-        "skills": ["concept1","concept2"],
-        "deadline_sec": 60 | null,
-        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
-    }} | null,
-    "assessment": {{"correct": true|false|null, "explanation": "OOC coach hint/why", "delta_mastery": 0,
-                    "per_skill": [{{"skill":"probing","score":0..3}},{{"skill":"listening","score":0..3}}] }} | null,
-    "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
-    }}
-    """.strip()
-
-    sys_msg = SYSTEM_ROLEPLAY_SCOPED.format(
-        user_role=scenario.get("user_role","Learner"),
-        bot_role=scenario.get("bot_role","Mentor"),
-        emotion=scenario.get("emotion","supportive"),
-        difficulty=difficulty,
-        learning_style=scenario.get("learning_style",""),
+def _hf_chat(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 800) -> str:
+    completion = client.chat.completions.create(
+        model=HF_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
+    msg = completion.choices[0].message
+    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return str(content or "")
 
-    raw = _hf_chat(
-        [{"role": "system", "content": sys_msg},
-         {"role": "user", "content": ingest_user}],
-        temperature=0.1, max_tokens=900,
-    )
 
-    data = _safe_json_loads(raw)
-    needed = ("chapter_summary", "learning_objectives", "roleplay_persona", "exercise")
-    if any(k not in data for k in needed):
-        data = {
-            "chapter_summary": data.get("chapter_summary") or "(No summary returned by model.)",
-            "learning_objectives": data.get("learning_objectives") or [
-                "Grasp the key ideas", "Practice one applied example"
-            ],
-            "roleplay_persona": data.get("roleplay_persona") or "Supportive subject-matter coach",
-            "exercise": data.get("exercise") or {
-                "type": "reflection",
-                "instructions": "In 2–3 lines, tell me what you hope to learn from this chapter.",
-                "prompt": "What feels hardest right now?",
-                "choices": None,
-                "answer": None,
-                "skills": ["metacognition"]
-            }
-        }
+def _safe_json_loads(s: str) -> Dict[str, Any]:
+    if isinstance(s, dict):
+        return s
+    text = (s or "").strip()
+    if text.startswith("```"):
+        lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    try:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        pass
+    return {"reply": text, "new_exercise": None, "citations": []}
 
-    state = TutorState(
-        user_id=user_id,
-        profile=profile,
-        chapter_title=chapter_title,
-        chapter_source=chapter_source,
-        chapter_summary=data["chapter_summary"],
-        learning_objectives=data["learning_objectives"],
-        roleplay_persona=data["roleplay_persona"],
-        exercise_queue=[data["exercise"]],
-        chunks=chunks,
-        index=index,
-        scenario=scenario,
-        last_prompt_at=time.time(),
-    )
-    SESSION[user_id] = state
 
-    first_prompt = data["exercise"].get("instructions") or data["exercise"].get("prompt") or \
-                   "Let's begin. Tell me what you understand so far."
-
-    lesson_plan = {
+def _state_public_view(state: TutorState) -> Dict[str, Any]:
+    return {
+        "chapter_title": state.chapter_title,
+        "chapter_source": state.chapter_source,
         "chapter_summary": state.chapter_summary,
         "learning_objectives": state.learning_objectives,
         "roleplay_persona": state.roleplay_persona,
-        "first_exercise": data["exercise"],
+        "signals_preview": asdict(state.signals),
+        "exercise_queue_len": len(state.exercise_queue),
     }
-    return IngestResponse(user_id=user_id, lesson_plan=lesson_plan, first_prompt=first_prompt)
+
+# =====================
+# Prompts
+# =====================
+REFUSAL_PREFIX = "I’m limited to the provided chapter"
+
+PLANNER_SYSTEM = (
+    """
+        You build a short, interactive, in-world reenactment strictly within the supplied CHAPTER SNIPPETS.
+        - Choose ONE bot character who plausibly appears/speaks in this chapter (or an in-world narrator like a child/neighbor). No tutors, no meta.
+        - Provide a 3–5 sentence chapter_summary grounded ONLY in snippets; use [C#] when referencing specifics.
+        - Derive 2–4 learning_objectives aligned to the learner's goal.
+        - Create the FIRST role-play exercise that opens IN CHARACTER (one line + ONE question). No teaching voice.
+        - Exercise must be:
+        - type: "roleplay"
+        - instructions: what the learner tries to do in-scene
+        - prompt: opening situation (in-character)
+        - choices: null (prefer free response)
+        - answer: concise rubric (OOC) for debriefing later
+        - skills: 2–4 tags (e.g., empathy, text_evidence, bias_check, curiosity)
+        - deadline_sec: 45–90s if tension fits (else null)
+        Output JSON ONLY with keys: chapter_summary, learning_objectives, roleplay_persona, exercise
+            """
+        ).strip()
+
+RUNTIME_SYSTEM = (
+            """
+        You are a chapter-scoped, in-world character for a role-play.
+
+        Scope rules (hard):
+        - Use ONLY the CHAPTER SNIPPETS provided.
+        - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
+        - Never invent facts. Any claim about the chapter must be supportable by snippets; include citations like [C1], [C2].
+
+        Contract:
+        - Speak fully IN CHARACTER (dialogue/action). No meta, no teaching voice.
+        - One turn = ONE realistic line or action + optionally ONE question.
+        - Keep things immersive; if the user goes outside the chapter, redirect gently in-character back to provided events.
+
+        Output JSON ONLY (no code fences):
+        {{
+        "reply": "<in-character utterance only>",
+        "citations": ["C1","C2"] | [],
+        "new_exercise": {{
+            "type": "roleplay",
+            "instructions": "<what the learner is trying to do in-scene>",
+            "prompt": "<next in-character situation or question>",
+            "choices": null,
+            "answer": "<concise rubric/criteria (OOC, for later debrief)>",
+            "skills": ["empathy","text_evidence","bias_check","curiosity"],
+            "deadline_sec": 60 | null,
+            "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
+        }} | null,
+        "internal_log_patch": {{"empathy": -1..+1, "text_evidence": -1..+1, "bias_check": -1..+1, "curiosity": -1..+1}}
+        }}
+            """
+        ).strip()
+
+DEBRIEF_SYSTEM = (
+    """
+        You produce a SINGLE end-of-session feedback based solely on:
+        - the session transcript (in-character dialogue)
+        - tracked signals (empathy, text_evidence, bias_check, curiosity)
+        - the learner goal
+        - the provided chapter snippets
+
+        Rules (hard):
+        - Cite ONLY this chapter via [C#] from the supplied snippet IDs when making text-based claims.
+        - No long lectures; keep it concise and actionable.
+
+        Output JSON ONLY:
+        {{
+        "summary": "2–4 sentences: what the learner practiced/experienced",
+        "strengths": ["...","..."],
+        "growth": ["one or two concrete next steps"],
+        "chapter_evidence": [{{"quote_or_paraphrase": "...", "why_it_matters": "...", "citations": ["C#"]}}],
+        "metrics": {{"empathy": 0..1, "text_evidence": 0..1, "bias_check": 0..1, "curiosity": 0..1}}
+        }}
+            """
+        ).strip()
+
+# =====================
+# Ingest
+# =====================
+class _ProfileShim(BaseModel):
+    background: str
+    goals: str
+    level: str | None = None
 
 def _decode_text_file(file_bytes: bytes) -> str:
-    # light, resilient decoding for .txt
     try:
         return file_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -439,159 +328,78 @@ def _decode_text_file(file_bytes: bytes) -> str:
             return file_bytes.decode("utf-8", errors="ignore")
 
 
-def _hf_chat(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 800) -> str:
-    """Single place to call the HF chat model; returns raw content string."""
-    completion = client.chat.completions.create(
-        model=HF_MODEL,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
+def _ingest_core(user_id: str, chapter_title: str, chapter_text: str,
+                 chapter_source: str | None, profile: dict[str, Any]) -> IngestResponse:
+    chunks = chunk_text(chapter_text)
+    index = build_index(chunks)
+
+    # Small evidence pack for planning
+    top = retrieve(f"summary + objectives for: {chapter_title}", chunks, index, k=3)
+    sources_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
+
+    planner_user = f"""
+        Learner profile:
+        - Background: {profile.get('background')}
+        - Goals: {profile.get('goals')}
+        - Level: {profile.get('level') or 'unspecified'}
+
+        CHAPTER SNIPPETS (the ONLY allowed knowledge):
+        {sources_block}
+
+        Build the reenactment plan as specified.
+        """.strip()
+
+    raw = _hf_chat(
+        [{"role": "system", "content": PLANNER_SYSTEM},
+         {"role": "user", "content": planner_user}],
+        temperature=0.15, max_tokens=900
     )
-    # Normalize to string across providers
-    msg = completion.choices[0].message
-    content = None
-    if isinstance(msg, dict):
-        content = msg.get("content")
-    else:
-        content = getattr(msg, "content", None)
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    if content is None:
-        content = ""
-    return str(content)
+    data = _safe_json_loads(raw)
 
-SCENE_GRAPH = {
-    "opening": {"probe_deeper": "probe"},
-    "probe": {"escalate_objection": "objection", "switch_perspective": "probe", "probe_deeper": "probe"},
-    "objection": {"de_escalate": "resolution", "probe_deeper": "objection"},
-    "resolution": {"probe_deeper": "resolution", "close_out": "wrap"},
-    "wrap": {}
-}
+    # Fallbacks if model under-fills
+    lesson = {
+        "chapter_summary": data.get("chapter_summary") or "(No summary returned)",
+        "learning_objectives": data.get("learning_objectives") or ["Explore the scene", "Practice grounded interpretation"],
+        "roleplay_persona": data.get("roleplay_persona") or "In-world narrator",
+        "exercise": data.get("exercise") or {
+            "type": "roleplay",
+            "instructions": "Enter the scene and describe what you do next.",
+            "prompt": "(In-character) You stand at the edge of the scene. What do you do?",
+            "choices": None,
+            "answer": "Responds in-character and grounded in snippet details.",
+            "skills": ["curiosity"],
+            "deadline_sec": None
+        }
+    }
 
-def apply_branch_and_adapt(state: TutorState, data: Dict[str, Any]) -> None:
-    scen = state.scenario or {}
-    branch = (data.get("new_exercise") or {}).get("branch")
-    cur = state.scene
-
-    # scene transitions
-    nxt = SCENE_GRAPH.get(cur, {}).get(branch)
-    if nxt:
-        state.scene = nxt
-        state.scene_step = 0
-    else:
-        state.scene_step += 1
-
-    # adaptive difficulty (target ~70% success)
-    a = data.get("assessment") or {}
-    correct = a.get("correct", None)
-    cur_diff = int(scen.get("difficulty", 1))
-    if correct is True and state.progress.correct_in_a_row >= 2 and cur_diff < 5:
-        scen["difficulty"] = cur_diff + 1
-    elif correct is False and state.progress.correct_in_a_row == 0 and cur_diff > 1:
-        scen["difficulty"] = cur_diff - 1
-
-    # branch-driven pressure/tone/perspective
-    if branch == "raise_time_pressure":
-        scen["time_pressure"] = True
-    elif branch == "de_escalate":
-        scen["time_pressure"] = False
-    elif branch == "switch_perspective":
-        # swap between Mentor and Client for demo variety
-        cur_role = scen.get("bot_role", "Mentor")
-        scen["bot_role"] = "Client" if cur_role == "Mentor" else "Mentor"
-
-    state.scenario = scen
-
-
-def _ensure_assessment_present(data: Dict[str, Any], sys_msg: str, user_msg: str) -> Dict[str, Any]:
-    if isinstance(data.get("assessment"), dict):
-        return data
-    repair_user = (
-        user_msg +
-        "\n\nAdd an 'assessment' object explaining briefly why the user's last step is right/wrong and one next micro-nudge."
-        " Output JSON only with {\"assessment\":{...}}."
+    state = TutorState(
+        user_id=user_id,
+        profile=profile,
+        chapter_title=chapter_title,
+        chapter_source=chapter_source,
+        chapter_summary=lesson["chapter_summary"],
+        learning_objectives=lesson["learning_objectives"],
+        roleplay_persona=lesson["roleplay_persona"],
+        chunks=chunks,
+        index=index,
+        exercise_queue=[lesson["exercise"]],
+        last_prompt_at=time.time(),
     )
-    raw2 = _hf_chat(
-        [{"role":"system","content": sys_msg}, {"role":"user","content": repair_user}],
-        temperature=0.1, max_tokens=250
-    )
-    data2 = _safe_json_loads(raw2)
-    if isinstance(data2.get("assessment"), dict):
-        data["assessment"] = data2["assessment"]
-    return data
+    SESSION[user_id] = state
 
-
-def _safe_json_loads(s: str) -> Dict[str, Any]:
-    """Parse model output into JSON.
-    - Strips ``` fences
-    - Tries direct json.loads
-    - Then extracts first {...} block
-    - Falls back to a safe wrapper to avoid KeyErrors
-    """
-    if isinstance(s, dict):
-        return s
-    text = (s or "").strip()
-
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-
-    # Try direct parse
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Heuristic: grab first {...} block
-    try:
-        import re
-        m = re.search("\\{[\\s\\S]*\\}", text)
-        if m:
-            return json.loads(m.group(0))
-    except Exception:
-        pass
-
-    return {"reply": text, "new_exercise": None, "assessment": None, "progress_update": None}
-
-
-def _state_public_view(state: TutorState) -> Dict[str, Any]:
-    # Redact long fields for UI
-    return {
-        "chapter_title": state.chapter_title,
-        "chapter_source": state.chapter_source,
+    first_prompt = lesson["exercise"].get("prompt") or lesson["exercise"].get("instructions") or "(In-character) Let's begin."
+    lesson_plan = {
         "chapter_summary": state.chapter_summary,
         "learning_objectives": state.learning_objectives,
         "roleplay_persona": state.roleplay_persona,
-        "progress": asdict(state.progress),
-        "exercise_queue_len": len(state.exercise_queue),
+        "first_exercise": lesson["exercise"],
     }
+    return IngestResponse(user_id=user_id, lesson_plan=lesson_plan, first_prompt=first_prompt)
 
-############################################################
+# =====================
 # Endpoints
-############################################################
-@app.post("/scenario", response_model=ScenarioSetResponse)
-def set_scenario(cfg: ScenarioConfig):
-    state = SESSION.get(cfg.user_id)
-    if not state:
-        # minimal shell so /ingest can fill remaining fields later
-        state = TutorState(
-            user_id=cfg.user_id,
-            profile={"background": "", "goals": "", "level": ""},
-            chapter_title="",
-            chapter_source=None,
-            chapter_summary="",
-            learning_objectives=[],
-            roleplay_persona="",
-        )
-        SESSION[cfg.user_id] = state
-
-    state.scenario = cfg.model_dump()
-    state.updated_at = time.time()
-    return ScenarioSetResponse(ok=True)
-
+# =====================
 @app.post("/ingest", response_model=IngestResponse)
-
 def ingest(req: IngestRequest):
     return _ingest_core(
         user_id=req.user_id,
@@ -622,16 +430,11 @@ async def ingest_file(
     if not chapter_text:
         raise HTTPException(status_code=400, detail="Empty or unreadable text file.")
 
-    # Auto-title if not provided
     if not chapter_title:
         first_line = next((ln.strip() for ln in chapter_text.splitlines() if ln.strip()), "")
         chapter_title = (first_line[:80] or "Untitled Chapter")
 
-    profile = {
-        "background": profile_background,
-        "goals": profile_goals,
-        "level": profile_level or "unspecified",
-    }
+    profile = {"background": profile_background, "goals": profile_goals, "level": profile_level or "unspecified"}
 
     return _ingest_core(
         user_id=user_id,
@@ -640,14 +443,17 @@ async def ingest_file(
         chapter_source=chapter_source,
         profile=profile,
     )
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    # 0) Ensure session exists
     state = SESSION.get(req.user_id)
     if not state:
         raise HTTPException(status_code=404, detail="No active session. Call /ingest first.")
+    if state.ended:
+        raise HTTPException(status_code=400, detail="Session already ended. Start a new session or call /reset.")
 
-    # 1) Retrieve top-k chapter snippets for this turn
+    # Retrieve chapter snippets relevant to the user's turn
     top = retrieve(req.message, state.chunks, state.index, k=3)
     if not top:
         if state.chunks:
@@ -661,160 +467,141 @@ def chat(req: ChatRequest):
 
     sources_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
 
-    user_msg = CHAT_USER_SCOPED.format(
-        background=state.profile.get("background"),
-        goals=state.profile.get("goals"),
-        level=state.profile.get("level") or "unspecified",
-        chapter_title=state.chapter_title,
-        learning_objectives=", ".join(state.learning_objectives),
-        sources_block=sources_block,
-        user_message=req.message,
-    )
-    scenario = state.scenario or {}
+    # User message payload for runtime
+    user_payload = f"""
+        Learner:
+        - Background: {state.profile.get('background')}
+        - Goals: {state.profile.get('goals')}
+        - Level: {state.profile.get('level') or 'unspecified'}
 
-    user_role=scenario.get("user_role","Learner")
-    bot_role = scenario.get("bot_role","Mentor")
-    emotion =scenario.get("emotion","supportive")
-    learning_style = scenario.get("learning_style","")
-    difficulty = int(scenario.get("difficulty", 1))
-    
+        Chapter: {state.chapter_title}
+        CHAPTER SNIPPETS (the ONLY allowed knowledge):
+        {sources_block}
 
-    SYSTEM_ROLEPLAY_SCOPED = """
-    You are "Roleplay Partner", a chapter-scoped simulation coach.
+        User says (in-scene): "{req.message}"
 
-    Scope rules (hard):
-    - Use ONLY the CHAPTER SNIPPETS provided.
-    - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
-    - Never invent facts. Any statement that relies on the chapter must be supportable by the snippets; include citations like [C1], [C2].
-
-    Role-play contract:
-    - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
-    - Your "reply" MUST be fully in-character dialogue/action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
-    - Ask exactly ONE realistic question or take ONE action per turn.
-    - Coaching/teaching goes ONLY in "assessment.explanation" (out-of-character), 1–3 sentences, grounded in the chapter with citations when needed.
-
-    Output JSON ONLY (no code fences):
-    {{
-    "reply": "<in-character utterance only>",
-    "citations": ["C1","C2"] | [],
-    "new_exercise": {{
-        "type": "roleplay",
-        "instructions": "<what the learner is trying to do in-scene>",
-        "prompt": "<scene setup or next move>",
-        "choices": null,
-        "answer": "<concise rubric/criteria (OOC)>",
-        "skills": ["concept1","concept2"],
-        "deadline_sec": 60 | null,
-        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
-    }} | null,
-    "assessment": {{"correct": true|false|null, "explanation": "OOC coach hint/why", "delta_mastery": 0,
-                    "per_skill": [{{"skill":"probing","score":0..3}},{{"skill":"listening","score":0..3}}] }} | null,
-    "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
-    }}
-    """.strip()
-
-
-    sys_msg = SYSTEM_ROLEPLAY_SCOPED.format(
-        user_role=scenario.get("user_role", "Learner"),
-        bot_role=scenario.get("bot_role", "Mentor"),
-        emotion=scenario.get("emotion", "supportive"),
-        difficulty=scenario.get("difficulty", 1),
-        learning_style=scenario.get("learning_style", ""),
-    )
+        Return internal_log_patch to reflect the learner’s last move (approximate). Do NOT include any coaching or assessment.
+        """.strip()
 
     raw = _hf_chat(
-        [
-            {"role": "system", "content": sys_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.1,
-        max_tokens=700,
+        [{"role": "system", "content": RUNTIME_SYSTEM},
+         {"role": "user", "content": user_payload}],
+        temperature=0.12, max_tokens=700
     )
     data = _safe_json_loads(raw)
-
-    # 2) Enforce citations (soft retry)
+    data = _denest_if_needed(data)
+    # Enforce citations (soft retry)
     allowed = [cid for cid, _ in top]
-    if not _valid_citations(data.get("citations"), allowed) and not (data.get("reply","").startswith(REFUSAL_PREFIX)):
-        retry_msg = user_msg + "\n\nReminder: You MUST cite only from these snippet IDs and you MUST include 'citations'."
+    def _valid_citations(cites: Any) -> bool:
+        return isinstance(cites, list) and (not cites or all(c in allowed for c in cites))
+
+    if not _valid_citations(data.get("citations")) and not (data.get("reply", "").startswith(REFUSAL_PREFIX)):
+        retry_msg = user_payload + "\n\nReminder: You MUST cite only from these snippet IDs and you MUST include 'citations'."
         raw2 = _hf_chat(
-            [
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": retry_msg},
-            ],
-            temperature=0.1,
-            max_tokens=700,
+            [{"role": "system", "content": RUNTIME_SYSTEM}, {"role": "user", "content": retry_msg}],
+            temperature=0.12, max_tokens=700
         )
         data2 = _safe_json_loads(raw2)
-        if _valid_citations(data2.get("citations"), allowed) or data2.get("reply","").startswith(REFUSAL_PREFIX):
+        data2 = _denest_if_needed(data2)
+        
+        if _valid_citations(data2.get("citations")) or data2.get("reply", "").startswith(REFUSAL_PREFIX):
             data = data2
 
-    # 3) Optional: deadline/time-pressure check on last exercise
-    if state.exercise_queue and isinstance(state.exercise_queue[-1], dict):
-        deadline = state.exercise_queue[-1].get("deadline_sec")
-        if deadline:
-            elapsed = time.time() - (state.last_prompt_at or time.time())
-            if elapsed > float(deadline):
-                data.setdefault("assessment", {})
-                data["assessment"]["correct"] = False
-                data["assessment"]["explanation"] = f"Time ran out (>{int(deadline)}s). Let's review key steps."
-                data["assessment"]["delta_mastery"] = -1
+    # Silent signal tracking
+    ilog = data.get("internal_log_patch") or {}
+    def _clamp(v):
+        try:
+            return max(-1.0, min(1.0, float(v)))
+        except:
+            return 0.0
+    patch = {
+        "empathy": _clamp(ilog.get("empathy", 0)),
+        "text_evidence": _clamp(ilog.get("text_evidence", 0)),
+        "bias_check": _clamp(ilog.get("bias_check", 0)),
+        "curiosity": _clamp(ilog.get("curiosity", 0)),
+    }
+    state.signals.empathy += patch["empathy"]
+    state.signals.text_evidence += patch["text_evidence"]
+    state.signals.bias_check += patch["bias_check"]
+    state.signals.curiosity += patch["curiosity"]
+    state.signal_log.append(patch)
 
-    # 4) Update progress if assessment present
-    # Always ensure we coach OOC
-    data = _ensure_assessment_present(data, sys_msg=sys_msg, user_msg=user_msg)
-
-    # Progress update (you already have this)
-    assessment = data.get("assessment") or {}
-    if assessment and isinstance(assessment, dict):
-        state.progress.attempts += 1
-        if assessment.get("correct") is True:
-            state.progress.correct_in_a_row += 1
-            state.progress.mastery = max(0, min(100, state.progress.mastery + int(assessment.get("delta_mastery", 2))))
-        elif assessment.get("correct") is False:
-            state.progress.correct_in_a_row = 0
-            state.progress.mastery = max(0, min(100, state.progress.mastery - 1))
-
-    # Scene + adaptation controller
-    apply_branch_and_adapt(state, data)
-
-    # Force roleplay type for exercises
-    # Force roleplay type for exercises
+    # Force roleplay type for any exercise
     new_ex = data.get("new_exercise")
     if isinstance(new_ex, dict) and new_ex.get("type") != "roleplay":
         new_ex["type"] = "roleplay"
 
-    # ✅ Persist so deadlines and scene progress work next turn
     if isinstance(new_ex, dict):
         state.exercise_queue.append(new_ex)
         state.last_prompt_at = time.time()
 
-    # 6) Maintain short history (last 10 turns)
+    # Maintain short history
     state.history.append({"user": req.message, "assistant": data.get("reply", "")})
-    state.history = state.history[-10:]
+    state.history = state.history[-14:]
     state.updated_at = time.time()
-
-    # 7) Return
-  # Coerce exercise type to roleplay if present
-    # new_ex = data.get("new_exercise")
-    # if isinstance(new_ex, dict) and new_ex.get("type") != "roleplay":
-    #     new_ex["type"] = "roleplay"
 
     payload = {
         "user_id": req.user_id,
         "reply": data.get("reply", "(No reply)"),
         "state": _state_public_view(state),
-        "assessment": data.get("assessment"),   # OOC coaching/explanation
-        "citations": data.get("citations"),     # chapter-source proof
+        "citations": data.get("citations"),
     }
     if new_ex:
         payload["new_exercise"] = new_ex
-
     return payload
 
 
-    # if new_ex:
-    #     payload["new_exercise"] = new_ex
-    # return payload  # FastAPI will coerce to ChatResponse
+@app.post("/end", response_model=EndResponse)
+def end_session(req: EndRequest):
+    state = SESSION.get(req.user_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="No active session. Call /ingest first.")
+
+    if state.ended:
+        return EndResponse(user_id=req.user_id, final_feedback={"summary": "(already ended)", "strengths": [], "growth": [], "chapter_evidence": [], "metrics": asdict(state.signals)})
+
+    transcript_text = "\n".join([f"User: {t.get('user','')}\nBot: {t.get('assistant','')}" for t in state.history])[-3500:]
+
+    top = retrieve("Session recap and justification", state.chunks, state.index, k=5)
+    if not top and state.chunks:
+        top = [(f"C{i+1}", c) for i, c in enumerate(state.chunks[:5])]
+    evidence_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
+
+    # squash signals roughly into [0,1]
+    s = state.signals
+    signals_norm = {
+        "empathy": max(0.0, min(1.0, (s.empathy + 3) / 6)),
+        "text_evidence": max(0.0, min(1.0, (s.text_evidence + 3) / 6)),
+        "bias_check": max(0.0, min(1.0, (s.bias_check + 3) / 6)),
+        "curiosity": max(0.0, min(1.0, (s.curiosity + 3) / 6)),
+    }
+
+    user_msg = f"""
+        Learner goal: {state.profile.get('goals')}
+        Transcript (trimmed):
+        {transcript_text}
+
+        Signals (approx):
+        {json.dumps(signals_norm)}
+
+        CHAPTER SNIPPETS (allowed citations only):
+        {evidence_block}
+
+        Return JSON only as specified.
+        """.strip()
+
+    raw = _hf_chat(
+        [{"role": "system", "content": DEBRIEF_SYSTEM}, {"role": "user", "content": user_msg}],
+        temperature=0.2, max_tokens=700
+    )
+    data = _safe_json_loads(raw)
+    data.setdefault("metrics", signals_norm)
+
+    state.ended = True
+    state.updated_at = time.time()
+
+    return EndResponse(user_id=req.user_id, final_feedback=data)
+
 
 @app.get("/state/{user_id}")
 def get_state(user_id: str) -> Dict[str, Any]:
@@ -829,14 +616,3 @@ def reset(user_id: str):
     if user_id in SESSION:
         del SESSION[user_id]
     return {"ok": True}
-
-############################################################
-# Notes for Frontend Integration (summary)
-############################################################
-# 1) Call POST /ingest with { user_id, chapter_title, chapter_text, chapter_source?, profile }
-#    -> Render lesson_plan and show first_prompt to the user.
-# 2) For each user message, call POST /chat with { user_id, message }.
-#    -> Show `reply` and, if desired, render the top of `exercise_queue` for interaction.
-# 3) Persist state server-side (Redis/DB). The SESSION dict is only for demo.
-# 4) Consider adding SSE/websocket streaming if your HF endpoint supports it.
-# 5) For safety/format drift, keep _safe_json_loads and consider guardrails (JSON schema validation).
