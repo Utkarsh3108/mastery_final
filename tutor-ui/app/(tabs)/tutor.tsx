@@ -4,6 +4,9 @@ import {
   KeyboardAvoidingView, Platform, ActivityIndicator, Alert
 } from "react-native";
 
+import * as DocumentPicker from "expo-document-picker";
+
+
 // IMPORTANT: Point this to your FastAPI server.
 // iOS Simulator: http://localhost:8000
 // Android Emulator: http://10.0.2.2:8000
@@ -196,6 +199,18 @@ const ExerciseCard: React.FC<{
 /** -------------------------
  * API helpers
  * ------------------------*/
+async function apiIngestFile(fd: FormData): Promise<IngestResponse> {
+  const res = await fetch(`${BASE_URL}/ingest_file`, {
+    method: "POST",
+    body: fd, // fetch sets multipart boundaries automatically
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Ingest (file) failed: ${res.status} ${t}`);
+  }
+  return res.json();
+}
+
 
 async function apiScenario(payload: {
   user_id: string;
@@ -262,6 +277,8 @@ type Msg =
 
 export default function TutorScreen() {
   const [screen, setScreen] = useState<"setup" | "chat">("setup");
+  const [pickedFile, setPickedFile] = useState<{ uri: string; name: string; mime: string } | null>(null);
+
 
   // Setup form
   const [userId, setUserId] = useState("demo-user");
@@ -310,48 +327,51 @@ export default function TutorScreen() {
   }, [lesson, chapterTitle]);
 
   const startLesson = async () => {
-    try {
-      setLoading(true);
+  try {
+    setLoading(true);
+    let res: IngestResponse;
 
-      // 1) POST /scenario (safe even if minimal)
-      await apiScenario({
-        user_id: userId,
-        book,
-        user_role: userRole,
-        bot_role: botRole,
-        difficulty: Number(difficulty || 1),
-        learning_style: learningStyle,
-        time_pressure: timePressure,
-        emotion,
-        roleplay_only: true,
-      });
+    if (pickedFile) {
+      const fd = new FormData();
+      fd.append("user_id", userId);
+      fd.append("chapter_title", chapterTitle);
+      fd.append("profile_background", background);
+      fd.append("profile_goals", goals);
+      fd.append("profile_level", level);
+      if (chapterSource) fd.append("chapter_source", chapterSource);
 
-      // 2) POST /ingest
-      const res = await apiIngest({
+      fd.append("chapter_file", {
+        uri: pickedFile.uri,
+        name: pickedFile.name,
+        type: pickedFile.mime || "text/plain",
+      } as any);
+
+      res = await apiIngestFile(fd);
+    } else {
+      res = await apiIngest({
         user_id: userId,
         chapter_title: chapterTitle,
         chapter_text: chapterText,
         chapter_source: chapterSource || undefined,
         profile: { background, goals, level },
       });
-
-      const lp: LessonPlan = res.lesson_plan;
-      setLesson(lp);
-
-      const initMsgs: Msg[] = [];
-      if (res.first_prompt) {
-        initMsgs.push({ kind: "bubble", role: "assistant", text: res.first_prompt });
-      }
-      if (lp.first_exercise) initMsgs.push({ kind: "exercise", ex: lp.first_exercise });
-      setMessages(initMsgs);
-
-      setScreen("chat");
-    } catch (e: any) {
-      Alert.alert("Error", e?.message || String(e));
-    } finally {
-      setLoading(false);
     }
-  };
+
+    const lp: LessonPlan = res.lesson_plan;
+    setLesson(lp);
+
+    const initMsgs: any[] = [];
+    if (res.first_prompt) initMsgs.push({ kind: "bubble", role: "assistant", text: res.first_prompt });
+    if (lp.first_exercise) initMsgs.push({ kind: "exercise", ex: lp.first_exercise });
+    setMessages(initMsgs);
+    setScreen("chat");
+  } catch (e: any) {
+    Alert.alert("Error", e?.message || String(e));
+  } finally {
+    setLoading(false);
+  }
+};
+
 
   const sendMessage = async (text: string) => {
     if (!text.trim()) return;
@@ -414,6 +434,25 @@ export default function TutorScreen() {
               <Input label="Chapter Title" value={chapterTitle} onChangeText={setChapterTitle} />
               <Input label="Chapter Source (optional)" value={chapterSource} onChangeText={setChapterSource} />
               <Input label="Chapter Text" value={chapterText} onChangeText={setChapterText} multiline placeholder="Paste the chapter/material here" />
+              <TouchableOpacity
+                onPress={async () => {
+                  const res = await DocumentPicker.getDocumentAsync({
+                    type: "text/plain",
+                    multiple: false,
+                    copyToCacheDirectory: true,
+                  });
+                  if (res.canceled) return;
+                  const file = res.assets[0];
+                  setPickedFile({
+                    uri: file.uri,
+                    name: file.name ?? "chapter.txt",
+                    mime: file.mimeType ?? "text/plain",
+                  });
+                }}
+                style={{ paddingVertical: 10, paddingHorizontal: 12, borderWidth: 1, borderColor: "#D1D5DB", borderRadius: 8 }}
+              >
+                <Text>{pickedFile ? `📄 ${pickedFile.name}` : "Choose .txt file"}</Text>
+              </TouchableOpacity>
             </Section>
 
             <Section title="Profile for Personalization">

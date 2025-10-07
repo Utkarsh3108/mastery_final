@@ -17,6 +17,7 @@ import os
 import time
 import re
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import UploadFile, File, Form
 
 ############################################################
 # Model / client setup
@@ -291,6 +292,152 @@ Follow SYSTEM_TUTOR rules and output JSON ONLY using the specified schema.
 # Utility: model call + robust JSON parsing
 ############################################################
 
+# --- shared ingest core ---
+def _ingest_core(user_id: str, chapter_title: str, chapter_text: str,
+                 chapter_source: str | None, profile: dict[str, Any]) -> IngestResponse:
+    # 1) Build retrieval artifacts
+    chunks = chunk_text(chapter_text)
+    index = build_index(chunks)
+
+    # 2) Use retrieval to plan (overview)
+    overview_q = f"Provide a short summary and learning objectives for: {chapter_title}"
+    top = retrieve(overview_q, chunks, index, k=3)
+    sources_block = "\n".join([f"[{{cid}}] {{txt}}" for cid, txt in top])
+
+    # 3) Scenario parameters (if set via /scenario)
+    sess = SESSION.get(user_id)
+    scenario = getattr(sess, "scenario", {}) if sess else {}
+    time_pressure = bool(scenario.get("time_pressure", False))
+    difficulty = int(scenario.get("difficulty", 1))
+
+    ingest_user = f"""
+    User profile:
+    - Background: {profile.get("background")}
+    - Goals: {profile.get("goals")}
+    - Level: {profile.get("level") or "unspecified"}
+
+    Scenario:
+    - Learner role: {scenario.get("user_role","Learner")}
+    - Your role: {scenario.get("bot_role","Mentor")}
+    - Difficulty: {difficulty}/5
+    - Learning style: {scenario.get("learning_style","")}
+    - Time pressure: {time_pressure}
+
+    CHAPTER SNIPPETS:
+    {sources_block}
+
+    Task: Build a lesson plan and the first in-scope ROLE-PLAY exercise STRICTLY from the snippets.
+    - The first 'reply' must be an in-character opening line from {scenario.get("bot_role","the mentor")} that sets the scene and asks ONE question.
+    - The returned 'exercise' MUST set "type": "roleplay" with an OOC 'answer' rubric to judge the learner's next turn.
+    - If time_pressure is True, include a reasonable 'deadline_sec' (45–90s).
+    Return only the lesson JSON.
+    """.strip()
+
+    SYSTEM_ROLEPLAY_SCOPED = """
+    You are "Roleplay Partner", a chapter-scoped simulation coach.
+
+    Scope rules (hard):
+    - Use ONLY the CHAPTER SNIPPETS provided.
+    - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
+    - Never invent facts. Any statement that relies on the chapter must be supportable by the snippets; include citations like [C1], [C2].
+
+    Role-play contract:
+    - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
+    - Your "reply" MUST be fully in-character dialogue/action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
+    - Ask exactly ONE realistic question or take ONE action per turn.
+    - Coaching/teaching goes ONLY in "assessment.explanation" (out-of-character), 1–3 sentences, grounded in the chapter with citations when needed.
+
+    Output JSON ONLY (no code fences):
+    {{
+    "reply": "<in-character utterance only>",
+    "citations": ["C1","C2"] | [],
+    "new_exercise": {{
+        "type": "roleplay",
+        "instructions": "<what the learner is trying to do in-scene>",
+        "prompt": "<scene setup or next move>",
+        "choices": null,
+        "answer": "<concise rubric/criteria (OOC)>",
+        "skills": ["concept1","concept2"],
+        "deadline_sec": 60 | null,
+        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
+    }} | null,
+    "assessment": {{"correct": true|false|null, "explanation": "OOC coach hint/why", "delta_mastery": 0,
+                    "per_skill": [{{"skill":"probing","score":0..3}},{{"skill":"listening","score":0..3}}] }} | null,
+    "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
+    }}
+    """.strip()
+
+    sys_msg = SYSTEM_ROLEPLAY_SCOPED.format(
+        user_role=scenario.get("user_role","Learner"),
+        bot_role=scenario.get("bot_role","Mentor"),
+        emotion=scenario.get("emotion","supportive"),
+        difficulty=difficulty,
+        learning_style=scenario.get("learning_style",""),
+    )
+
+    raw = _hf_chat(
+        [{"role": "system", "content": sys_msg},
+         {"role": "user", "content": ingest_user}],
+        temperature=0.1, max_tokens=900,
+    )
+
+    data = _safe_json_loads(raw)
+    needed = ("chapter_summary", "learning_objectives", "roleplay_persona", "exercise")
+    if any(k not in data for k in needed):
+        data = {
+            "chapter_summary": data.get("chapter_summary") or "(No summary returned by model.)",
+            "learning_objectives": data.get("learning_objectives") or [
+                "Grasp the key ideas", "Practice one applied example"
+            ],
+            "roleplay_persona": data.get("roleplay_persona") or "Supportive subject-matter coach",
+            "exercise": data.get("exercise") or {
+                "type": "reflection",
+                "instructions": "In 2–3 lines, tell me what you hope to learn from this chapter.",
+                "prompt": "What feels hardest right now?",
+                "choices": None,
+                "answer": None,
+                "skills": ["metacognition"]
+            }
+        }
+
+    state = TutorState(
+        user_id=user_id,
+        profile=profile,
+        chapter_title=chapter_title,
+        chapter_source=chapter_source,
+        chapter_summary=data["chapter_summary"],
+        learning_objectives=data["learning_objectives"],
+        roleplay_persona=data["roleplay_persona"],
+        exercise_queue=[data["exercise"]],
+        chunks=chunks,
+        index=index,
+        scenario=scenario,
+        last_prompt_at=time.time(),
+    )
+    SESSION[user_id] = state
+
+    first_prompt = data["exercise"].get("instructions") or data["exercise"].get("prompt") or \
+                   "Let's begin. Tell me what you understand so far."
+
+    lesson_plan = {
+        "chapter_summary": state.chapter_summary,
+        "learning_objectives": state.learning_objectives,
+        "roleplay_persona": state.roleplay_persona,
+        "first_exercise": data["exercise"],
+    }
+    return IngestResponse(user_id=user_id, lesson_plan=lesson_plan, first_prompt=first_prompt)
+
+def _decode_text_file(file_bytes: bytes) -> str:
+    # light, resilient decoding for .txt
+    try:
+        return file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return file_bytes.decode("latin-1")
+        except Exception:
+            return file_bytes.decode("utf-8", errors="ignore")
+
+
 def _hf_chat(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 800) -> str:
     """Single place to call the HF chat model; returns raw content string."""
     completion = client.chat.completions.create(
@@ -443,153 +590,50 @@ def set_scenario(cfg: ScenarioConfig):
     return ScenarioSetResponse(ok=True)
 
 @app.post("/ingest", response_model=IngestResponse)
+
 def ingest(req: IngestRequest):
-    """Create/refresh a tutoring session from chapter + profile and return first exercise.
-    Chapter-scoped: chunk the chapter, build retriever, and ask the model using only retrieved snippets.
-    """
-    # 1) Build retrieval artifacts
-    chunks = chunk_text(req.chapter_text)
-    index = build_index(chunks)
-
-    # 2) Use retrieval to plan (overview)
-    overview_q = f"Provide a short summary and learning objectives for: {req.chapter_title}"
-    top = retrieve(overview_q, chunks, index, k=3)
-    sources_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
-
-    # 3) Scenario parameters (if set via /scenario)
-    sess = SESSION.get(req.user_id)
-    scenario = getattr(sess, "scenario", {}) if sess else {}
-    time_pressure = bool(scenario.get("time_pressure", False))
-    difficulty = int(scenario.get("difficulty", 1))
-    user_role=scenario.get("user_role","Learner")
-    bot_role = scenario.get("bot_role","Mentor")
-    emotion =scenario.get("emotion","supportive")
-    learning_style = scenario.get("learning_style","")
-
-    ingest_user = f"""
-    User profile:
-    - Background: {req.profile.background}
-    - Goals: {req.profile.goals}
-    - Level: {req.profile.level or "unspecified"}
-
-    Scenario:
-    - Learner role: {scenario.get("user_role","Learner")}
-    - Your role: {scenario.get("bot_role","Mentor")}
-    - Difficulty: {difficulty}/5
-    - Learning style: {scenario.get("learning_style","")}
-    - Time pressure: {time_pressure}
-
-    CHAPTER SNIPPETS:
-    {sources_block}
-
-    Task: Build a lesson plan and the first in-scope ROLE-PLAY exercise STRICTLY from the snippets.
-    - The first 'reply' must be an in-character opening line from {scenario.get("bot_role","the mentor")} that sets the scene and asks ONE question.
-    - The returned 'exercise' MUST set "type": "roleplay" with an OOC 'answer' rubric to judge the learner's next turn.
-    - If time_pressure is True, include a reasonable 'deadline_sec' (45–90s).
-    Return only the lesson JSON.
-    """.strip()
-
-
-    SYSTEM_ROLEPLAY_SCOPED = """
-    You are "Roleplay Partner", a chapter-scoped simulation coach.
-
-    Scope rules (hard):
-    - Use ONLY the CHAPTER SNIPPETS provided.
-    - If insufficient, reply: "I’m limited to the provided chapter and don’t have enough information in it to answer that. I can help you explore what the chapter does cover."
-    - Never invent facts. Any statement that relies on the chapter must be supportable by the snippets; include citations like [C1], [C2].
-
-    Role-play contract:
-    - Learner role: {user_role}. Your role: {bot_role}. Tone: {emotion}. Difficulty: {difficulty}/5. Learning style: {learning_style}.
-    - Your "reply" MUST be fully in-character dialogue/action as {bot_role}. Do NOT break character. Do NOT include teaching meta in "reply".
-    - Ask exactly ONE realistic question or take ONE action per turn.
-    - Coaching/teaching goes ONLY in "assessment.explanation" (out-of-character), 1–3 sentences, grounded in the chapter with citations when needed.
-
-    Output JSON ONLY (no code fences):
-    {{
-    "reply": "<in-character utterance only>",
-    "citations": ["C1","C2"] | [],
-    "new_exercise": {{
-        "type": "roleplay",
-        "instructions": "<what the learner is trying to do in-scene>",
-        "prompt": "<scene setup or next move>",
-        "choices": null,
-        "answer": "<concise rubric/criteria (OOC)>",
-        "skills": ["concept1","concept2"],
-        "deadline_sec": 60 | null,
-        "branch": "<probe_deeper|raise_time_pressure|de_escalate|switch_perspective|escalate_objection|close_out>|null"
-    }} | null,
-    "assessment": {{"correct": true|false|null, "explanation": "OOC coach hint/why", "delta_mastery": 0,
-                    "per_skill": [{{"skill":"probing","score":0..3}},{{"skill":"listening","score":0..3}}] }} | null,
-    "progress_update": {{"mastery": 0, "correct_in_a_row": 0}} | null
-    }}
-    """.strip()
-
-
-    sys_msg = SYSTEM_ROLEPLAY_SCOPED.format(
-        user_role=scenario.get("user_role","Learner"),
-        bot_role=scenario.get("bot_role","Mentor"),
-        emotion=scenario.get("emotion","supportive"),
-        difficulty=difficulty,
-        learning_style=scenario.get("learning_style",""),
-    )
-
-    raw = _hf_chat(
-        [
-            {"role": "system", "content": sys_msg},
-            {"role": "user", "content": ingest_user},
-        ],
-        temperature=0.1,
-        max_tokens=900,
-    )
-
-    data = _safe_json_loads(raw)
-    # Defensive fallback to avoid 5xx
-    needed = ("chapter_summary", "learning_objectives", "roleplay_persona", "exercise")
-    if any(k not in data for k in needed):
-        data = {
-            "chapter_summary": data.get("chapter_summary") or "(No summary returned by model.)",
-            "learning_objectives": data.get("learning_objectives") or [
-                "Grasp the key ideas", "Practice one applied example"
-            ],
-            "roleplay_persona": data.get("roleplay_persona") or "Supportive subject-matter coach",
-            "exercise": data.get("exercise") or {
-                "type": "reflection",
-                "instructions": "In 2–3 lines, tell me what you hope to learn from this chapter.",
-                "prompt": "What feels hardest right now?",
-                "choices": None,
-                "answer": None,
-                "skills": ["metacognition"]
-            }
-        }
-
-    # 4) Build and save state (store retrieval artifacts)
-    state = TutorState(
+    return _ingest_core(
         user_id=req.user_id,
-        profile=req.profile.model_dump(),
         chapter_title=req.chapter_title,
+        chapter_text=req.chapter_text,
         chapter_source=req.chapter_source,
-        chapter_summary=data["chapter_summary"],
-        learning_objectives=data["learning_objectives"],
-        roleplay_persona=data["roleplay_persona"],
-        exercise_queue=[data["exercise"]],
-        chunks=chunks,
-        index=index,
-        scenario=scenario,
-        last_prompt_at=time.time(),
+        profile=req.profile.model_dump(),
     )
-    SESSION[req.user_id] = state
 
-    first_prompt = data["exercise"].get("instructions") or data["exercise"].get("prompt") or \
-                   "Let's begin. Tell me what you understand so far."
 
-    lesson_plan = {
-        "chapter_summary": state.chapter_summary,
-        "learning_objectives": state.learning_objectives,
-        "roleplay_persona": state.roleplay_persona,
-        "first_exercise": data["exercise"],
+@app.post("/ingest_file", response_model=IngestResponse)
+async def ingest_file(
+    user_id: str = Form(...),
+    chapter_title: str = Form(...),
+    profile_background: str = Form(...),
+    profile_goals: str = Form(...),
+    profile_level: Optional[str] = Form(None),
+    chapter_source: Optional[str] = Form(None),
+    chapter_file: UploadFile = File(...),
+):
+    # basic guards
+    if chapter_file.filename and not chapter_file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Please upload a .txt file.")
+    raw = await chapter_file.read()
+    if len(raw) > 2 * 1024 * 1024:  # 2MB guard (adjust as needed)
+        raise HTTPException(status_code=413, detail="Text file too large (max 2MB).")
+
+    chapter_text = _decode_text_file(raw).strip()
+    if not chapter_text:
+        raise HTTPException(status_code=400, detail="Empty or unreadable text file.")
+
+    profile = {
+        "background": profile_background,
+        "goals": profile_goals,
+        "level": profile_level or "unspecified",
     }
-
-    return IngestResponse(user_id=req.user_id, lesson_plan=lesson_plan, first_prompt=first_prompt)
+    return _ingest_core(
+        user_id=user_id,
+        chapter_title=chapter_title,
+        chapter_text=chapter_text,
+        chapter_source=chapter_source,
+        profile=profile,
+    )
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
