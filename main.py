@@ -302,8 +302,9 @@ def _ingest_core(user_id: str, chapter_title: str, chapter_text: str,
     # 2) Use retrieval to plan (overview)
     overview_q = f"Provide a short summary and learning objectives for: {chapter_title}"
     top = retrieve(overview_q, chunks, index, k=3)
-    sources_block = "\n".join([f"[{{cid}}] {{txt}}" for cid, txt in top])
 
+    # sources_block = "\n".join([f"[{{cid}}] {{txt}}" for cid, txt in top])
+    sources_block = "\n".join([f"[{cid}] {txt}" for cid, txt in top])
     # 3) Scenario parameters (if set via /scenario)
     sess = SESSION.get(user_id)
     scenario = getattr(sess, "scenario", {}) if sess else {}
@@ -611,22 +612,27 @@ async def ingest_file(
     chapter_source: Optional[str] = Form(None),
     chapter_file: UploadFile = File(...),
 ):
-    # basic guards
     if chapter_file.filename and not chapter_file.filename.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="Please upload a .txt file.")
     raw = await chapter_file.read()
-    if len(raw) > 2 * 1024 * 1024:  # 2MB guard (adjust as needed)
+    if len(raw) > 2 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Text file too large (max 2MB).")
 
     chapter_text = _decode_text_file(raw).strip()
     if not chapter_text:
         raise HTTPException(status_code=400, detail="Empty or unreadable text file.")
 
+    # Auto-title if not provided
+    if not chapter_title:
+        first_line = next((ln.strip() for ln in chapter_text.splitlines() if ln.strip()), "")
+        chapter_title = (first_line[:80] or "Untitled Chapter")
+
     profile = {
         "background": profile_background,
         "goals": profile_goals,
         "level": profile_level or "unspecified",
     }
+
     return _ingest_core(
         user_id=user_id,
         chapter_title=chapter_title,
@@ -634,7 +640,6 @@ async def ingest_file(
         chapter_source=chapter_source,
         profile=profile,
     )
-
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     # 0) Ensure session exists

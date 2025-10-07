@@ -199,16 +199,48 @@ const ExerciseCard: React.FC<{
 /** -------------------------
  * API helpers
  * ------------------------*/
-async function apiIngestFile(fd: FormData): Promise<IngestResponse> {
-  const res = await fetch(`${BASE_URL}/ingest_file`, {
-    method: "POST",
-    body: fd, // fetch sets multipart boundaries automatically
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Ingest (file) failed: ${res.status} ${t}`);
+// async function apiIngestFile(fd: FormData): Promise<IngestResponse> {
+//   const res = await fetch(`${BASE_URL}/ingest_file`, {
+//     method: "POST",
+//     body: fd, // fetch sets multipart boundaries automatically
+//   });
+//   if (!res.ok) {
+//     const t = await res.text();
+//     throw new Error(`Ingest (file) failed: ${res.status} ${t}`);
+//   }
+//   return res.json();
+// }
+
+// put near your API helpers
+async function toFormDataFile(
+  picked: { uri: string; name?: string; mime?: string }
+): Promise<any /* RN file or Web File */> {
+  const filename = picked.name || "chapter.txt";
+  const mime = picked.mime || "text/plain";
+
+  if (Platform.OS === "web") {
+    // Browser needs a Blob/File
+    const blob = await fetch(picked.uri).then(r => r.blob());
+    return new File([blob], filename, { type: mime });
   }
-  return res.json();
+  // Native (iOS/Android) needs { uri, name, type }
+  return { uri: picked.uri, name: filename, type: mime } as any;
+}
+
+async function apiIngestFile(fd: FormData): Promise<IngestResponse> {
+  const res = await fetch(`${BASE_URL}/ingest_file`, { method: "POST", body: fd });
+  const body = await res.text(); // read once
+  if (!res.ok) {
+    // show server 422 body in the UI logs
+    try {
+      const json = JSON.parse(body);
+      console.log("IngestFile error JSON:", json);
+    } catch {
+      console.log("IngestFile error text:", body);
+    }
+    throw new Error(`Ingest (file) failed: ${res.status} ${body}`);
+  }
+  return JSON.parse(body);
 }
 
 
@@ -326,7 +358,7 @@ export default function TutorScreen() {
     );
   }, [lesson, chapterTitle]);
 
-  const startLesson = async () => {
+ const startLesson = async () => {
   try {
     setLoading(true);
     let res: IngestResponse;
@@ -334,20 +366,19 @@ export default function TutorScreen() {
     if (pickedFile) {
       const fd = new FormData();
       fd.append("user_id", userId);
-      fd.append("chapter_title", chapterTitle);
+      // Backend will auto-title if this is empty, so safe either way:
+      fd.append("chapter_title", chapterTitle || "");
       fd.append("profile_background", background);
       fd.append("profile_goals", goals);
-      fd.append("profile_level", level);
+      fd.append("profile_level", level || "");
       if (chapterSource) fd.append("chapter_source", chapterSource);
 
-      fd.append("chapter_file", {
-        uri: pickedFile.uri,
-        name: pickedFile.name,
-        type: pickedFile.mime || "text/plain",
-      } as any);
+      const filePart = await toFormDataFile(pickedFile);
+      fd.append("chapter_file", filePart); // <- name matches backend
 
       res = await apiIngestFile(fd);
     } else {
+      // JSON fallback for quick testing without a file
       res = await apiIngest({
         user_id: userId,
         chapter_title: chapterTitle,
@@ -360,7 +391,7 @@ export default function TutorScreen() {
     const lp: LessonPlan = res.lesson_plan;
     setLesson(lp);
 
-    const initMsgs: any[] = [];
+    const initMsgs: Msg[] = [];
     if (res.first_prompt) initMsgs.push({ kind: "bubble", role: "assistant", text: res.first_prompt });
     if (lp.first_exercise) initMsgs.push({ kind: "exercise", ex: lp.first_exercise });
     setMessages(initMsgs);
@@ -371,6 +402,7 @@ export default function TutorScreen() {
     setLoading(false);
   }
 };
+
 
 
   const sendMessage = async (text: string) => {
